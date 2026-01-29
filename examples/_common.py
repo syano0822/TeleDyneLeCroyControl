@@ -9,8 +9,9 @@ import matplotlib.pyplot as plt
 from teledyne_lecroy import (
     AcquisitionConfig,
     ChannelConfig,
+    ChannelTrigger,
     TriggerConfig,
-    TriggerSlope,
+    TriggerState,
     WavePro,
     WaveRunner,
     WaveformData,
@@ -41,9 +42,10 @@ def default_acquisition_config() -> AcquisitionConfig:
 
 def default_trigger_config() -> TriggerConfig:
     return TriggerConfig(
-        source_channels=[1, 2],
-        slope=TriggerSlope.RISING,
-        level_offset=0.0,
+        channels={
+            1: ChannelTrigger(state=TriggerState.HIGH, level_offset=0.0),
+            2: ChannelTrigger(state=TriggerState.HIGH, level_offset=0.0),
+        },
         mode="SINGLE",
     )
 

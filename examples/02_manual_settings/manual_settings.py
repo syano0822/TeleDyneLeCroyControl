@@ -8,10 +8,11 @@ from pathlib import Path
 from teledyne_lecroy import (
     AcquisitionConfig,
     ChannelConfig,
+    ChannelTrigger,
     ScopeConfigurationError,
     ScopeConnectionError,
     TriggerConfig,
-    TriggerSlope,
+    TriggerState,
 )
 from examples._common import make_scope
 
@@ -47,11 +48,19 @@ def load_settings(config_path: Path) -> tuple[dict[int, ChannelConfig], Acquisit
         sampling_period=data["acquisition"]["sampling_period"],
     )
 
+    trigger_data = data["trigger"]
+    trigger_channels = {}
+    for ch, cfg in trigger_data.get("channels", {}).items():
+        trigger_channels[int(ch)] = ChannelTrigger(
+            state=TriggerState[cfg["state"]],
+            level=cfg.get("level"),
+            level_offset=cfg.get("level_offset", 0.0),
+        )
     trigger = TriggerConfig(
-        source_channels=data["trigger"]["source_channels"],
-        slope=TriggerSlope[data["trigger"]["slope"]],
-        level_offset=data["trigger"]["level_offset"],
-        mode=data["trigger"]["mode"],
+        channels=trigger_channels,
+        mode=trigger_data.get("mode", "SINGLE"),
+        external=trigger_data.get("external", False),
+        external_level=trigger_data.get("external_level", 1.25),
     )
 
     return channels, acquisition, trigger
@@ -70,7 +79,10 @@ def main() -> None:
             print("Manual settings applied.")
             print(f"Channels: {list(channels.keys())}")
             print(f"TDIV: {acquisition.tdiv} s/div")
-            print(f"Trigger: {trigger.slope.name} edge on CH{trigger.source_channels}")
+            trigger_info = ", ".join(
+                f"CH{ch}={cfg.state.name}" for ch, cfg in trigger.channels.items()
+            )
+            print(f"Trigger: {trigger_info} ({trigger.mode})")
             print("Verify changes on the scope front panel.")
     except (ScopeConnectionError, ScopeConfigurationError) as e:
         print(f"Configuration failed: {e}")

@@ -20,6 +20,11 @@ def parse_args():
     p.add_argument("--address", default="192.168.0.10")
     p.add_argument("--outdir", default=".")
     p.add_argument("--segments", type=int, default=100)
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Use force trigger for testing without real signals",
+    )
     return p.parse_args()
 
 
@@ -39,7 +44,7 @@ def main() -> None:
 
             print("Arming for sequence capture...")
             scope.arm()
-            scope.wait_for_trigger(timeout=10.0)
+            scope.wait_for_trigger(timeout=10.0, force=args.force)
             print("Triggered.")
 
             data = scope.readout_sequence()

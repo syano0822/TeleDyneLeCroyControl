@@ -16,9 +16,10 @@
     "sampling_period": 1e-6
   },
   "trigger": {
-    "source_channels": [1, 2],
-    "slope": "RISING",
-    "level_offset": 0.0,
+    "channels": {
+      "1": {"state": "HIGH", "level": 0.1},
+      "2": {"state": "LOW", "level": -0.05}
+    },
     "mode": "SINGLE"
   }
 }

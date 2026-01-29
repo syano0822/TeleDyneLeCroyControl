@@ -8,10 +8,12 @@ Bong-Hwi Lim (UTokyo)
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Literal
@@ -25,7 +27,9 @@ from pyvisa.resources import MessageBasedResource
 __all__ = [
     # Enums
     "TriggerSlope",
+    "TriggerState",
     "Coupling",
+    "AuxOutputMode",
     # Exceptions
     "ScopeError",
     "ScopeConnectionError",
@@ -34,6 +38,7 @@ __all__ = [
     "ScopeTriggerError",
     # Config dataclasses
     "ChannelConfig",
+    "ChannelTrigger",
     "TriggerConfig",
     "AcquisitionConfig",
     "SequenceConfig",
@@ -48,10 +53,17 @@ __all__ = [
 
 
 class TriggerSlope(Enum):
-    """Trigger edge direction."""
+    """Trigger edge direction (legacy, use TriggerState for pattern trigger)."""
     RISING = auto()
     FALLING = auto()
     EITHER = auto()
+
+
+class TriggerState(Enum):
+    """Per-channel trigger state for pattern trigger."""
+    HIGH = "H"       # Trigger on high level (rising edge)
+    LOW = "L"        # Trigger on low level (falling edge)
+    DONT_CARE = "X"  # Don't use this channel for triggering
 
 
 class Coupling(Enum):
@@ -59,6 +71,12 @@ class Coupling(Enum):
     DC50 = "D50"   # 50Ω DC
     DC1M = "D1M"   # 1MΩ DC
     AC1M = "A1M"   # 1MΩ AC
+
+
+class AuxOutputMode(Enum):
+    """Auxiliary output mode."""
+    TRIGGER_OUT = "TriggerOut"           # Output trigger pulse
+    TRIGGER_ENABLED = "TriggerEnabled"   # Output when trigger is armed/enabled
 
 
 # === Exceptions ===
@@ -100,12 +118,41 @@ class ChannelConfig:
 
 
 @dataclass
+class ChannelTrigger:
+    """Per-channel trigger configuration.
+
+    Each channel can be HIGH, LOW, or DONT_CARE (X).
+    Level can be absolute or relative to baseline.
+    """
+    state: TriggerState = TriggerState.DONT_CARE
+    level: float | None = None     # V absolute (if set, ignores level_offset)
+    level_offset: float = 0.0      # V relative to baseline (used if level is None)
+
+
+@dataclass
 class TriggerConfig:
-    """Trigger configuration."""
-    source_channels: list[int] = field(default_factory=lambda: [1])
-    slope: TriggerSlope = TriggerSlope.FALLING
-    level_offset: float = -0.01    # V relative to baseline
+    """Trigger configuration with per-channel settings.
+
+    Example:
+        TriggerConfig(
+            channels={
+                1: ChannelTrigger(state=TriggerState.HIGH, level=0.1),
+                2: ChannelTrigger(state=TriggerState.LOW, level=-0.05),
+            },
+            mode="SINGLE"
+        )
+
+    External trigger example:
+        TriggerConfig(
+            external=True,
+            external_level=1.25,  # V
+            channels={1: ChannelTrigger(state=TriggerState.HIGH, level=0.1)},
+        )
+    """
+    channels: dict[int, ChannelTrigger] = field(default_factory=dict)
     mode: Literal["AUTO", "NORM", "SINGLE", "STOP"] = "SINGLE"
+    external: bool = False         # Use external trigger (EX)
+    external_level: float = 1.25   # External trigger level (V)
 
 
 @dataclass
@@ -301,12 +348,20 @@ class TeledyneLecroyScope(ABC):
         channels: dict[int, ChannelConfig],
         acquisition: AcquisitionConfig,
         sequence: SequenceConfig | None = None,
+        display: bool = False,
     ) -> None:
-        """Configure scope with given settings."""
+        """Configure scope with given settings.
+
+        Args:
+            channels: Channel configurations
+            acquisition: Acquisition/timebase configuration
+            sequence: Optional sequence mode configuration
+            display: Keep display on (True) or off for faster acquisition (False)
+        """
         self._validate_config(channels, acquisition)
 
         self.write("CHDR OFF")  # Remove response headers
-        self._configure_display()
+        self._configure_display(display=display)
         self._configure_timebase(acquisition)
 
         for ch, cfg in channels.items():
@@ -349,11 +404,234 @@ class TeledyneLecroyScope(ABC):
             self.TIME_DIVISIONS * acquisition.tdiv / acquisition.sampling_period
         )
 
+    # === Read Settings from Scope ===
+
+    def _parse_numeric_response(self, response: str) -> float:
+        """Parse numeric value from SCPI response.
+
+        Handles formats like:
+        - "5E-6" (value only)
+        - "TDIV 5E-6 S" (command + value + unit)
+        - "C1:VDIV 2E-1 V" (channel:command + value + unit)
+        """
+        # Try to find a numeric value in the response
+        for part in response.split():
+            # Skip parts that look like commands or units
+            if ":" in part or part.isalpha():
+                continue
+            try:
+                return float(part)
+            except ValueError:
+                continue
+
+        # If no numeric found, try the whole string (minus trailing unit)
+        parts = response.split()
+        if len(parts) >= 2:
+            try:
+                return float(parts[-2])  # Value is typically second-to-last
+            except ValueError:
+                pass
+
+        raise ValueError(f"Could not parse numeric value from: {response}")
+
+    def read_channel_config(self, channel: int) -> ChannelConfig:
+        """Read current channel configuration from scope."""
+        self._ensure_connected()
+        if not 1 <= channel <= self.MAX_CHANNELS:
+            raise ScopeConfigurationError(f"Invalid channel: {channel}")
+
+        vdiv = self._parse_numeric_response(self.query(f"C{channel}:VDIV?"))
+        offset = self._parse_numeric_response(self.query(f"C{channel}:OFST?"))
+        trace_state = self.query(f"C{channel}:TRA?")
+        enabled = "ON" in trace_state.upper()
+
+        return ChannelConfig(vdiv=vdiv, offset=offset, enabled=enabled)
+
+    def read_acquisition_config(self) -> AcquisitionConfig:
+        """Read current acquisition configuration from scope."""
+        self._ensure_connected()
+
+        tdiv = self._parse_numeric_response(self.query("TDIV?"))
+
+        # Calculate sampling period from current memory size
+        memory_response = self.query("MSIZ?")
+        # Parse memory size (e.g., "10000", "10K", "1M", or "MSIZ 10000")
+        memory_str = memory_response.upper()
+        # Remove command prefix if present
+        if "MSIZ" in memory_str:
+            memory_str = memory_str.replace("MSIZ", "").strip()
+        # Handle K/M suffixes
+        memory_str = memory_str.replace("K", "E3").replace("M", "E6").replace("SA", "").strip()
+        try:
+            memory_size = self._parse_numeric_response(memory_str)
+            sampling_period = self.TIME_DIVISIONS * tdiv / memory_size
+        except ValueError:
+            # Fallback to a reasonable default
+            self._logger.warning(f"Could not parse memory size: {memory_response}")
+            sampling_period = tdiv / 1000
+
+        return AcquisitionConfig(tdiv=tdiv, sampling_period=sampling_period)
+
+    def read_trigger_level(self, channel: int) -> float:
+        """Read current trigger level for a channel."""
+        self._ensure_connected()
+        return self._parse_numeric_response(self.query(f"C{channel}:TRLV?"))
+
+    def read_trigger_pattern(self) -> dict[int, str]:
+        """Read current trigger pattern states for all channels.
+
+        Returns:
+            Dict mapping channel number to state ("H", "L", or "X")
+        """
+        self._ensure_connected()
+        response = self.query("TRPA?")
+        self._logger.debug(f"Trigger pattern response: {response}")
+
+        # Parse response like "TRPA C1,H,C2,L,C3,X,C4,X,STATE,OR"
+        states = {}
+        parts = response.replace("TRPA", "").strip().split(",")
+        for i in range(0, len(parts) - 2, 2):  # Skip last "STATE,OR" part
+            ch_part = parts[i].strip()
+            if ch_part.startswith("C") and len(parts) > i + 1:
+                try:
+                    ch = int(ch_part[1:])
+                    state = parts[i + 1].strip().upper()
+                    if state in ("H", "L", "X"):
+                        states[ch] = state
+                except (ValueError, IndexError):
+                    pass
+
+        return states
+
+    def read_all_settings(self) -> dict:
+        """Read all current settings from scope as a dictionary."""
+        self._ensure_connected()
+
+        # Read ALL channel settings (not just enabled)
+        channels = {}
+        for ch in range(1, self.MAX_CHANNELS + 1):
+            try:
+                config = self.read_channel_config(ch)
+                channels[str(ch)] = {
+                    "vdiv": config.vdiv,
+                    "offset": config.offset,
+                    "enabled": config.enabled,
+                }
+            except Exception as e:
+                self._logger.debug(f"Could not read channel {ch}: {e}")
+
+        # Read acquisition settings
+        acq = self.read_acquisition_config()
+        acquisition = {
+            "tdiv": acq.tdiv,
+            "sampling_period": acq.sampling_period,
+        }
+
+        # Read trigger mode
+        trigger_response = self.query("TRMD?").strip()
+        trigger_mode = trigger_response.split()[-1] if trigger_response else "SINGLE"
+
+        # Read trigger pattern states
+        try:
+            pattern_states = self.read_trigger_pattern()
+        except Exception as e:
+            self._logger.debug(f"Could not read trigger pattern: {e}")
+            pattern_states = {}
+
+        # Build per-channel trigger config
+        trigger_channels = {}
+        state_map = {"H": "HIGH", "L": "LOW", "X": "DONT_CARE"}
+
+        for ch in range(1, self.MAX_CHANNELS + 1):
+            try:
+                level = self.read_trigger_level(ch)
+                state_code = pattern_states.get(ch, "X")
+                state_name = state_map.get(state_code, "DONT_CARE")
+
+                trigger_channels[str(ch)] = {
+                    "state": state_name,
+                    "level": level,
+                }
+            except Exception as e:
+                self._logger.debug(f"Could not read trigger for channel {ch}: {e}")
+
+        trigger = {
+            "channels": trigger_channels,
+            "mode": trigger_mode,
+        }
+
+        return {
+            "channels": channels,
+            "acquisition": acquisition,
+            "trigger": trigger,
+        }
+
+    def save_settings(self, filepath: str | Path) -> None:
+        """Save current scope settings to JSON file."""
+        settings = self.read_all_settings()
+        filepath = Path(filepath)
+        with filepath.open("w") as f:
+            json.dump(settings, f, indent=2)
+        self._logger.info(f"Settings saved to {filepath}")
+
+    @staticmethod
+    def load_settings_file(filepath: str | Path) -> dict:
+        """Load settings from JSON file (static method, no scope needed)."""
+        filepath = Path(filepath)
+        with filepath.open() as f:
+            return json.load(f)
+
+    # === Offset and Auxiliary Output ===
+
+    def set_offset(
+        self,
+        channels: dict[int, float] | None = None,
+        search: bool = False,
+    ) -> dict[int, float]:
+        """Set channel offsets.
+
+        Args:
+            channels: Dict of channel -> offset (V). If None, uses all active channels.
+            search: If True, automatically find signal and set offset.
+
+        Returns:
+            Dict of channel -> actual offset set (V).
+        """
+        if search:
+            return self._auto_offset_search()
+
+        if channels is None:
+            channels = {ch: 0.0 for ch in self._active_channels}
+
+        for ch, offset in channels.items():
+            self.write(f"C{ch}:OFFSET {-offset}")
+            self._logger.debug(f"Channel {ch} offset: {offset}V")
+
+        return channels
+
+    def set_auxiliary_output(self, mode: AuxOutputMode) -> None:
+        """Set auxiliary output mode.
+
+        Args:
+            mode: AuxOutputMode.TRIGGER_OUT or AuxOutputMode.TRIGGER_ENABLED
+        """
+        self.write(f"""vbs 'app.Acquisition.AuxOutput.Mode = "{mode.value}"' """)
+        self._logger.info(f"Auxiliary output: {mode.value}")
+
+    @abstractmethod
+    def _auto_offset_search(self) -> dict[int, float]:
+        """Automatically find signal and set offset for each channel."""
+        ...
+
     # === Abstract Methods (implement in subclasses) ===
 
     @abstractmethod
-    def _configure_display(self) -> None:
-        """Configure display settings."""
+    def _configure_display(self, display: bool = False) -> None:
+        """Configure display settings.
+
+        Args:
+            display: Keep display on (True) or off for faster acquisition (False)
+        """
         ...
 
     @abstractmethod
@@ -378,10 +656,11 @@ class TeledyneLecroyScope(ABC):
         self._trigger_config = config
         self._setup_trigger_source(config)
         self._setup_trigger_level(config)
-        self._logger.info(
-            f"Trigger configured: channels={config.source_channels}, "
-            f"slope={config.slope.name}"
-        )
+
+        # Log trigger configuration
+        active = [f"CH{ch}:{t.state.name}" for ch, t in config.channels.items()
+                  if t.state != TriggerState.DONT_CARE]
+        self._logger.info(f"Trigger configured: {', '.join(active) or 'none'}")
 
     def arm(self, force: bool = False) -> None:
         """Arm trigger and wait for acquisition."""
@@ -390,17 +669,53 @@ class TeledyneLecroyScope(ABC):
             self.write("FRTR")  # Force trigger
             self._logger.debug("Forced trigger")
         else:
-            self.write("TRMD SINGLE")
+            mode = self._trigger_config.mode if self._trigger_config else "SINGLE"
+            self.write(f"TRMD {mode}")
             self.wait_opc()
-            self._logger.debug("Armed, waiting for trigger")
+            self._logger.debug(f"Armed with mode {mode}, waiting for trigger")
 
     def is_triggered(self) -> bool:
         """Check if trigger has occurred."""
         return "STOP" in self.query("TRMD?")
 
-    def wait_for_trigger(self, timeout: float | None = None) -> None:
-        """Wait for trigger with optional timeout."""
+    def wait_for_trigger(self, timeout: float | None = None, force: bool = False) -> None:
+        """Wait for trigger with optional timeout.
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            force: If True, use force trigger (useful for testing without signal)
+        """
         start = time.time()
+
+        # For sequence mode with force trigger - fill all segments immediately
+        if force and self._sequence_config and self._sequence_config.enabled:
+            num_segments = self._sequence_config.num_segments
+            for i in range(num_segments):
+                self.write("FRTR")
+                time.sleep(0.01)  # Small delay between force triggers
+                if timeout and (time.time() - start) > timeout:
+                    raise ScopeTimeoutError(f"Trigger timeout: {timeout}s")
+            self.write("TRMD STOP")
+            self.wait_opc()
+            self._logger.debug(f"Forced {num_segments} triggers for sequence capture")
+            return
+
+        # For sequence mode, use WAIT command which blocks until all segments captured
+        if self._sequence_config and self._sequence_config.enabled:
+            old_timeout = self._scope.timeout
+            if timeout:
+                self._scope.timeout = int(timeout * 1000)  # Convert to ms
+            try:
+                self.write("WAIT")
+                self.wait_opc()
+                self._logger.debug("Sequence acquisition complete")
+            except Exception as e:
+                raise ScopeTimeoutError(f"Trigger timeout: {timeout}s") from e
+            finally:
+                self._scope.timeout = old_timeout
+            return
+
+        # For normal mode, poll TRMD status
         while not self.is_triggered():
             if timeout and (time.time() - start) > timeout:
                 raise ScopeTimeoutError(f"Trigger timeout: {timeout}s")
@@ -503,10 +818,12 @@ class WavePro(TeledyneLecroyScope):
     MAX_BANDWIDTH: float = 8e9        # 8 GHz
     ADC_BITS: int = 8
 
-    def _configure_display(self) -> None:
+    def _configure_display(self, display: bool = False) -> None:
         """Configure display for remote operation."""
-        self.write("DISP OFF")
-        self.write("*RST")
+        if display:
+            self.write("DISP ON")
+        else:
+            self.write("DISP OFF")
         self.write("CHDR OFF")
         self.write("GRID QUATTRO")
 
@@ -561,31 +878,149 @@ class WavePro(TeledyneLecroyScope):
                 fr"""vbs 'app.Acquisition.Horizontal.SequenceTimeout = {config.timeout_seconds}' """
             )
 
+    def _get_trigger_channels(self, config: TriggerConfig) -> dict[int, ChannelTrigger]:
+        """Get channel trigger settings."""
+        return config.channels
+
     def _setup_trigger_source(self, config: TriggerConfig) -> None:
         """Setup trigger source with pattern trigger."""
-        slope_map = {
-            TriggerSlope.RISING: "H",
-            TriggerSlope.FALLING: "L",
-            TriggerSlope.EITHER: "X",
-        }
+        channels = self._get_trigger_channels(config)
 
         states = ["X"] * 4
-        for ch in config.source_channels:
-            states[ch - 1] = slope_map[config.slope]
+        for ch, ch_trig in channels.items():
+            if 1 <= ch <= 4:
+                states[ch - 1] = ch_trig.state.value
+
+        # External trigger state
+        ext_state = "H" if config.external else "X"
 
         self.write(
             f"TRPA C1,{states[0]},C2,{states[1]},C3,{states[2]},C4,{states[3]},"
-            "STATE,OR"
+            f"EX,{ext_state},STATE,OR"
         )
         self.write("TRIG_SELECT PA,SR,C1")
 
+        if config.external:
+            self._logger.debug(
+                f"Trigger pattern: C1={states[0]}, C2={states[1]}, C3={states[2]}, C4={states[3]}, EX={ext_state}"
+            )
+        else:
+            self._logger.debug(
+                f"Trigger pattern: C1={states[0]}, C2={states[1]}, C3={states[2]}, C4={states[3]}"
+            )
+
     def _setup_trigger_level(self, config: TriggerConfig) -> None:
-        """Setup trigger level relative to baseline."""
-        for ch in config.source_channels:
-            baseline = self._measure_baseline(ch)
-            level = baseline + config.level_offset
+        """Setup trigger level for each channel (absolute or relative to baseline)."""
+        channels = self._get_trigger_channels(config)
+
+        for ch, ch_trig in channels.items():
+            if ch_trig.state == TriggerState.DONT_CARE:
+                continue  # Skip channels not used for triggering
+
+            if ch_trig.level is not None:
+                # Use absolute level directly
+                level = ch_trig.level
+                self._logger.debug(f"Channel {ch} trigger level (absolute): {level}")
+            else:
+                # Measure baseline and add offset
+                baseline = self._measure_baseline(ch)
+                level = baseline + ch_trig.level_offset
+                self._logger.debug(f"Channel {ch} trigger level (baseline={baseline}, offset={ch_trig.level_offset}): {level}")
+
             self.write(f"C{ch}:TRLV {level}")
-            self._logger.debug(f"Channel {ch} trigger level: {level}")
+
+        # External trigger level
+        if config.external:
+            self.write(f"EX:TRLV {config.external_level}")
+            self._logger.debug(f"External trigger level: {config.external_level}V")
+
+    # Constants for offset search
+    _MIN_SIGNAL = 0.001      # V minimum amplitude to detect signal
+    _V_DIVISION = 6          # Divisions to scan for signal
+    _SHIFT_DIVISION = 2.5    # Divisions to shift after finding signal
+    _MAX_OFFSET = -1.0       # V maximum offset before giving up
+
+    def _auto_offset_search(self) -> dict[int, float]:
+        """Automatically find signal and set offset for each channel."""
+        offsets = {}
+
+        for ch in self._active_channels:
+            cfg = self._channel_configs.get(ch)
+            vdiv = cfg.vdiv if cfg else 0.020
+
+            # Setup measurements for this channel
+            self.write(f"PACU 1,MEAN,C{ch}")  # Baseline
+            self.write(f"PACU 2,AMPL,C{ch}")  # Amplitude
+
+            # Start with zero offset
+            initial_offset = 0.0
+            self.write(f"C{ch}:OFFSET 0")
+
+            # Scan for signal
+            self.write("TRMD AUTO")
+            time.sleep(1.0)
+            self.write("TRMD STOP")
+
+            amplitude_response = self.query(
+                r"""vbs? 'return=app.measure.p2.out.result.value' """
+            )
+
+            # Try to find signal by scanning offsets
+            iteration = 0
+            while True:
+                try:
+                    amplitude = float(amplitude_response.split()[-1])
+                    if amplitude >= self._MIN_SIGNAL:
+                        break
+                except (ValueError, IndexError):
+                    pass
+
+                # Move offset to search for signal
+                initial_offset -= vdiv * self._V_DIVISION
+                if initial_offset < self._MAX_OFFSET:
+                    self._logger.warning(
+                        f"Channel {ch}: Could not find signal, using offset=0"
+                    )
+                    offsets[ch] = 0.0
+                    break
+
+                self.write(f"C{ch}:OFFSET {initial_offset}")
+                self.write("TRMD AUTO")
+                time.sleep(1.0)
+                self.write("TRMD NORM")
+
+                amplitude_response = self.query(
+                    r"""vbs? 'return=app.measure.p2.out.result.value' """
+                )
+
+                iteration += 1
+                if iteration > 10:
+                    self._logger.warning(
+                        f"Channel {ch}: Max iterations, using offset=0"
+                    )
+                    offsets[ch] = 0.0
+                    break
+            else:
+                continue
+
+            # Found signal - measure baseline and set offset
+            baseline_response = self.query(
+                r"""vbs? 'return=app.measure.p1.out.result.value' """
+            )
+            try:
+                baseline = float(baseline_response.split()[-1])
+            except (ValueError, IndexError):
+                baseline = 0.0
+
+            # Shift signal to visible area
+            offset = vdiv * self._SHIFT_DIVISION - baseline
+            self.write(f"C{ch}:OFFSET {offset}")
+            offsets[ch] = -offset  # Return positive offset value
+
+            self._logger.info(f"Channel {ch}: auto offset = {-offset:.4f}V")
+
+        self.write("TRMD NORM")
+        return offsets
 
     def _measure_baseline(self, channel: int) -> float:
         """Measure baseline using parameter measurement."""
@@ -596,11 +1031,25 @@ class WavePro(TeledyneLecroyScope):
         time.sleep(0.5)
         self.write("TRMD NORM")
 
-        baseline_str = self.query(
+        response = self.query(
             r"""vbs? 'return=app.measure.p1.out.result.value' """
-        ).split()[-1]
+        )
+        self._logger.debug(f"Baseline measurement response: {response}")
 
-        return float(baseline_str)
+        # Extract numeric value from response
+        # Response format can vary; try to find a valid float
+        for part in response.split():
+            try:
+                return float(part)
+            except ValueError:
+                continue
+
+        # If no numeric value found, use 0 as baseline (DC level)
+        self._logger.warning(
+            f"Could not parse baseline for C{channel}, using 0. "
+            f"Response was: {response}"
+        )
+        return 0.0
 
     def _read_channel_data(self, channel: int) -> bytes:
         """Read raw waveform data."""
@@ -610,17 +1059,28 @@ class WavePro(TeledyneLecroyScope):
     def _get_waveform_scaling(
         self, channel: int
     ) -> tuple[float, float, float, float]:
-        """Get waveform scaling factors."""
-        if self._acquisition_config is None:
-            raise ScopeConfigurationError("Acquisition not configured")
+        """Get waveform scaling factors.
 
-        dx = self._acquisition_config.sampling_period
-        x0 = (
-            self.X0_DIVISION * float(self.query("TDIV?"))
-            + float(self.query("TRDL?"))
-        )
-        dy = float(self.query(f"C{channel}:VDIV?")) * self.DY_ADC_CONVERSION
-        y0 = -float(self.query(f"C{channel}:OFFSET?"))
+        If configure() was not called, reads values directly from scope.
+        """
+        # Get sampling period (dx)
+        if self._acquisition_config is not None:
+            dx = self._acquisition_config.sampling_period
+        else:
+            # Read from scope: calculate from TDIV and memory size
+            acq = self.read_acquisition_config()
+            dx = acq.sampling_period
+
+        # Get time origin (x0) - always read from scope for accuracy
+        tdiv = self._parse_numeric_response(self.query("TDIV?"))
+        trdl = self._parse_numeric_response(self.query("TRDL?"))
+        x0 = self.X0_DIVISION * tdiv + trdl
+
+        # Get voltage scaling (dy, y0)
+        dy = self._parse_numeric_response(
+            self.query(f"C{channel}:VDIV?")
+        ) * self.DY_ADC_CONVERSION
+        y0 = -self._parse_numeric_response(self.query(f"C{channel}:OFFSET?"))
 
         return dx, x0, dy, y0
 

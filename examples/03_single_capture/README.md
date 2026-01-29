@@ -16,9 +16,21 @@ Capture a single waveform from the oscilloscope and save it as a PNG plot.
 # Default: WavePro at 192.168.0.10, output to current directory
 python -m examples.03_single_capture.single_capture
 
+# Testing without a real signal (force trigger)
+python -m examples.03_single_capture.single_capture --force
+
 # Specify model, address, and output directory
 python -m examples.03_single_capture.single_capture --model waverunner --address 192.168.1.100 --outdir ./captures
 ```
+
+## Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model` | `wavepro` | Oscilloscope model (`wavepro` or `waverunner`) |
+| `--address` | `192.168.0.10` | IP address of the oscilloscope |
+| `--outdir` | `.` | Output directory for plot files |
+| `--force` | off | Use force trigger for testing without real signals |
 
 ## Expected Output
 
@@ -39,6 +51,10 @@ After running:
 3. The "STOP" indicator appears after acquisition completes
 4. Waveform data is transferred to the PC and saved as PNG plots
 
+## Notes
+
+- This example does not change scope settings. Configure the scope first (see `examples/02_manual_settings`).
+
 ## Output Files
 
 - `single_capture_ch1.png` - Waveform plot for Channel 1
@@ -46,6 +62,6 @@ After running:
 
 ## Troubleshooting
 
-- **Timeout waiting for trigger**: Ensure a signal is connected and the trigger level is appropriate
+- **Timeout waiting for trigger**: Use `--force` flag for testing without real signals, or ensure a signal is connected
 - **No data returned**: Check that channels are enabled in the configuration
 - **Plot looks wrong**: Verify the vertical scale (vdiv) matches your signal amplitude

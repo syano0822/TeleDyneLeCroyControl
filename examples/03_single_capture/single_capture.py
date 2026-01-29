@@ -5,13 +5,7 @@ import argparse
 from pathlib import Path
 
 from teledyne_lecroy import ScopeConnectionError, ScopeTimeoutError
-from examples._common import (
-    default_acquisition_config,
-    default_channel_configs,
-    default_trigger_config,
-    make_scope,
-    plot_waveform,
-)
+from examples._common import make_scope, plot_waveform
 
 
 def parse_args():
@@ -19,6 +13,11 @@ def parse_args():
     p.add_argument("--model", choices=["wavepro", "waverunner"], default="wavepro")
     p.add_argument("--address", default="192.168.0.10")
     p.add_argument("--outdir", default=".")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Use force trigger for testing without real signals",
+    )
     return p.parse_args()
 
 
@@ -29,18 +28,23 @@ def main() -> None:
 
     try:
         with make_scope(args.model, args.address) as scope:
-            scope.configure(
-                channels=default_channel_configs(),
-                acquisition=default_acquisition_config(),
-            )
-            scope.set_trigger(default_trigger_config())
+            settings = scope.read_all_settings()
+            enabled_channels = [
+                int(ch)
+                for ch, cfg in settings["channels"].items()
+                if cfg.get("enabled")
+            ]
+            if not enabled_channels:
+                enabled_channels = [1]
+
+            scope.set_trigger_mode("SINGLE")
 
             print("Arming for single capture...")
             scope.arm()
-            scope.wait_for_trigger(timeout=10.0)
+            scope.wait_for_trigger(timeout=10.0, force=args.force)
             print("Triggered.")
 
-            data = scope.readout()
+            data = scope.readout(channels=enabled_channels)
             for ch, wf in data.items():
                 plot_waveform(
                     wf,

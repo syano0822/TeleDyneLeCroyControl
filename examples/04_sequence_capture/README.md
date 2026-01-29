@@ -23,6 +23,9 @@ Sequence mode captures multiple triggered events in rapid succession, storing ea
 # Default: WavePro at 192.168.0.10, 100 segments
 python -m examples.04_sequence_capture.sequence_capture
 
+# Testing without a real signal (force trigger)
+python -m examples.04_sequence_capture.sequence_capture --force --segments 10
+
 # Specify model, address, segments, and output directory
 python -m examples.04_sequence_capture.sequence_capture \
     --model waverunner \
@@ -30,6 +33,16 @@ python -m examples.04_sequence_capture.sequence_capture \
     --segments 50 \
     --outdir ./sequences
 ```
+
+## Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--model` | `wavepro` | Oscilloscope model (`wavepro` or `waverunner`) |
+| `--address` | `192.168.0.10` | IP address of the oscilloscope |
+| `--segments` | `100` | Number of segments to capture |
+| `--outdir` | `.` | Output directory for plot files |
+| `--force` | off | Use force trigger for testing without real signals |
 
 ## Expected Output
 
@@ -66,6 +79,6 @@ The full segment data is available in the `data` dictionary for further processi
 
 ## Troubleshooting
 
-- **Timeout waiting for trigger**: Sequence mode waits until all segments are captured
+- **Timeout waiting for trigger**: Use `--force` flag for testing without real signals, or ensure a signal is connected
 - **Fewer segments than expected**: Check if the trigger rate is too slow
 - **Memory errors**: Reduce `--segments` if the scope runs out of acquisition memory
