@@ -1,0 +1,24 @@
+{
+  "channels": {
+    "1": {
+      "vdiv": 0.2,
+      "offset": 0.0,
+      "enabled": true
+    },
+    "2": {
+      "vdiv": 0.2,
+      "offset": 0.0,
+      "enabled": true
+    }
+  },
+  "acquisition": {
+    "tdiv": 1e-3,
+    "sampling_period": 1e-6
+  },
+  "trigger": {
+    "source_channels": [1, 2],
+    "slope": "RISING",
+    "level_offset": 0.0,
+    "mode": "SINGLE"
+  }
+}
