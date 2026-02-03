@@ -43,22 +43,32 @@ python sequence_capture.py \
 | `--model` | `wavepro` | Oscilloscope model (`wavepro` or `waverunner`) |
 | `--address` | `192.168.0.10` | IP address of the oscilloscope |
 | `--segments` | `100` | Number of segments to capture |
-| `--outdir` | `.` | Output directory for plot files |
+| `--outdir` | `.` | Output directory for output files |
+| `--channels` | all enabled | Specific channels to capture (e.g., `--channels 1 2`) |
+| `--config` | `None` | Path to JSON settings file to apply (omit to read from scope) |
 | `--force` | off | Use force trigger for testing without real signals |
 
 ## Expected Output
 
 ```
-Arming for sequence capture...
+Capturing channels: [1, 2]
+Arming for sequence capture (100 segments)...
+  [arm] 52.3 ms
+  [wait_for_trigger] 156.7 ms
 Triggered.
-CH1 segments: 100
+  [readout_sequence] 2345.8 ms
+
+=== Data Size ===
+  CH1: 100 segments × 10,000 points = 1,000,000 bytes (1.00 MB)
+  CH2: 100 segments × 10,000 points = 1,000,000 bytes (1.00 MB)
+  Total: 2,000,000 bytes (2.00 MB)
+
+CH1: 100 segments
+  [save_data_ch1] 89.4 ms
+Saved data: sequence_ch1.npz
 CH1 stats: min=-0.150 V, max=0.152 V, mean=0.001 V, p2p=0.302 V
+  [plot_ch1_seg0] 234.5 ms
 Saved plot: sequence_ch1_seg0.png
-CH1 stats: min=-0.148 V, max=0.151 V, mean=0.002 V, p2p=0.299 V
-Saved plot: sequence_ch1_seg1.png
-CH1 stats: min=-0.149 V, max=0.150 V, mean=-0.001 V, p2p=0.299 V
-Saved plot: sequence_ch1_seg2.png
-CH2 segments: 100
 ...
 ```
 
@@ -73,11 +83,13 @@ After running:
 
 ## Output Files
 
-Only the first 3 segments per channel are plotted as a sanity check:
+Data files (all segments):
+- `sequence_ch1.npz` - All segment data for Channel 1 (voltages array, time axis)
+- `sequence_ch2.npz` - All segment data for Channel 2
+
+Plot files (first 3 segments as sanity check):
 - `sequence_ch1_seg0.png`, `sequence_ch1_seg1.png`, `sequence_ch1_seg2.png`
 - `sequence_ch2_seg0.png`, `sequence_ch2_seg1.png`, `sequence_ch2_seg2.png`
-
-The full segment data is available in the `data` dictionary for further processing.
 
 ## Troubleshooting
 

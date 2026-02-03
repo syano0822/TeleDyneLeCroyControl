@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+"""Sequence capture example - captures multiple segments using current scope settings."""
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -61,9 +63,8 @@ def save_sequence(seq: SequenceData, filepath: Path) -> None:
     """Save sequence data to numpy .npz file."""
     # Use the library method which handles inhomogeneous segment lengths (trimming)
     voltages = seq.to_voltage_array()
-    
+
     # Calculate time axis for one segment (assuming uniform)
-    # We take the first segment as reference
     if len(seq) > 0:
         time_axis = seq[0].to_time()
         # Ensure time axis matches voltage array width (in case of trimming)
@@ -81,11 +82,18 @@ def save_sequence(seq: SequenceData, filepath: Path) -> None:
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Capture sequence waveforms using current scope settings.")
     p.add_argument("--model", choices=["wavepro", "waverunner"], default="wavepro")
     p.add_argument("--address", default="192.168.0.10")
-    p.add_argument("--outdir", default=".")
-    p.add_argument("--segments", type=int, default=100)
+    p.add_argument("--outdir", type=Path, default=Path("."))
+    p.add_argument("--segments", type=int, default=100, help="Number of segments to capture (default: 100)")
+    p.add_argument("--channels", type=int, nargs="+", help="Channels to capture (default: all enabled)")
+    p.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to JSON settings file to apply (omit to read from scope and save to settings.json)",
+    )
     p.add_argument(
         "--force",
         action="store_true",
@@ -94,50 +102,49 @@ def parse_args():
     return p.parse_args()
 
 
-def load_or_create_settings(scope, settings_file: Path) -> dict:
-    """Load settings from file or create from current scope state."""
-    if settings_file.exists():
-        print(f"Loading settings from {settings_file}")
-        return scope.load_settings_file(settings_file)
-    else:
-        print("No settings file found, reading current scope settings...")
-        settings = scope.read_all_settings()
-        scope.save_settings(settings_file)
-        print(f"Settings saved to {settings_file}")
-        return settings
-
-
 def main() -> None:
     args = parse_args()
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    settings_file = outdir / "settings.json"
+    args.outdir.mkdir(parents=True, exist_ok=True)
 
     try:
         with make_scope(args.model, args.address) as scope:
-            with timed("load_settings"):
-                settings = load_or_create_settings(scope, settings_file)
-
-            # Override sequence settings with command line args
-            settings["sequence"] = {
-                "enabled": True,
-                "num_segments": args.segments,
-                "timeout_enabled": settings.get("sequence", {}).get("timeout_enabled", False),
-                "timeout_seconds": settings.get("sequence", {}).get("timeout_seconds", 2.5e6),
-            }
-
-            with timed("apply_settings"):
+            # Handle settings: apply from file or save current
+            if args.config:
+                print(f"Loading settings from: {args.config}")
+                with args.config.open() as f:
+                    settings = json.load(f)
                 scope.apply_settings(settings)
+                print("Settings applied.")
+            else:
+                settings = scope.read_all_settings()
+                output_path = Path("settings.json")
+                with output_path.open("w") as f:
+                    json.dump(settings, f, indent=2)
+                print(f"Current settings saved to: {output_path}")
 
-            enabled_channels = [
-                int(ch)
-                for ch, cfg in settings["channels"].items()
-                if cfg.get("enabled")
-            ]
-            if not enabled_channels:
-                enabled_channels = [1]
+            # Enable sequence mode with specified segment count
+            scope.apply_settings({
+                "sequence": {
+                    "enabled": True,
+                    "num_segments": args.segments,
+                }
+            })
 
+            # Determine channels to capture
+            if args.channels:
+                channels = args.channels
+            else:
+                settings = scope.read_all_settings()
+                channels = [
+                    int(ch) for ch, cfg in settings["channels"].items()
+                    if cfg.get("enabled")
+                ]
+            if not channels:
+                channels = [1]
+
+            print(f"Capturing channels: {channels}")
             print(f"Arming for sequence capture ({args.segments} segments)...")
+
             with timed("arm"):
                 scope.arm()
 
@@ -146,7 +153,7 @@ def main() -> None:
             print("Triggered.")
 
             with timed("readout_sequence"):
-                data = scope.readout_sequence(channels=enabled_channels)
+                data = scope.readout_sequence(channels=channels)
 
             # Data size diagnostics
             print("\n=== Data Size ===")
@@ -163,7 +170,7 @@ def main() -> None:
                 print(f"CH{ch}: {len(seq)} segments")
 
                 # Save all sequence data
-                data_file = outdir / f"sequence_ch{ch}.npz"
+                data_file = args.outdir / f"sequence_ch{ch}.npz"
                 with timed(f"save_data_ch{ch}"):
                     save_sequence(seq, data_file)
                 print(f"Saved data: {data_file.name}")
@@ -174,7 +181,7 @@ def main() -> None:
                     with timed(f"plot_ch{ch}_seg{idx}"):
                         plot_waveform(
                             wf,
-                            str(outdir / f"sequence_ch{ch}_seg{idx}.png"),
+                            str(args.outdir / f"sequence_ch{ch}_seg{idx}.png"),
                             title=f"Sequence CH{ch} Seg {idx}",
                         )
                     print(f"Saved plot: sequence_ch{ch}_seg{idx}.png")
