@@ -29,8 +29,8 @@
     "external_level": 1.25
   },
   "sequence": {
-    "enabled": false,
-    "num_segments": 1,
+    "enabled": true,
+    "num_segments": 100,
     "timeout_enabled": false,
     "timeout_seconds": 2500000.0
   },

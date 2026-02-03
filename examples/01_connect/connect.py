@@ -2,9 +2,22 @@
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
-from teledyne_lecroy import ScopeConnectionError
-from examples._common import make_scope
+# Add parent directory to path for direct execution
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+from teledyne_lecroy import ScopeConnectionError, WavePro, WaveRunner
+
+
+def make_scope(model: str, address: str):
+    """Create a scope instance based on model name."""
+    if model == "wavepro":
+        return WavePro(address)
+    if model == "waverunner":
+        return WaveRunner(address)
+    raise ValueError(f"Unknown model: {model}")
 
 
 def parse_args():

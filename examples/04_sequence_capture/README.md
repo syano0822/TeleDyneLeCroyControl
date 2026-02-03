@@ -20,14 +20,16 @@ Sequence mode captures multiple triggered events in rapid succession, storing ea
 ## Running the Example
 
 ```bash
+cd examples/04_sequence_capture
+
 # Default: WavePro at 192.168.0.10, 100 segments
-python -m examples.04_sequence_capture.sequence_capture
+python sequence_capture.py
 
 # Testing without a real signal (force trigger)
-python -m examples.04_sequence_capture.sequence_capture --force --segments 10
+python sequence_capture.py --force --segments 10
 
 # Specify model, address, segments, and output directory
-python -m examples.04_sequence_capture.sequence_capture \
+python sequence_capture.py \
     --model waverunner \
     --address 192.168.1.100 \
     --segments 50 \

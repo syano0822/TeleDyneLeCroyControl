@@ -13,14 +13,16 @@ Capture a single waveform from the oscilloscope and save it as a PNG plot.
 ## Running the Example
 
 ```bash
+cd examples/03_single_capture
+
 # Default: WavePro at 192.168.0.10, output to current directory
-python -m examples.03_single_capture.single_capture
+python single_capture.py
 
 # Testing without a real signal (force trigger)
-python -m examples.03_single_capture.single_capture --force
+python single_capture.py --force
 
 # Specify model, address, and output directory
-python -m examples.03_single_capture.single_capture --model waverunner --address 192.168.1.100 --outdir ./captures
+python single_capture.py --model waverunner --address 192.168.1.100 --outdir ./captures
 ```
 
 ## Command Line Options

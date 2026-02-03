@@ -15,20 +15,31 @@ Edit `settings.json` to customize the oscilloscope configuration:
 ```json
 {
   "channels": {
-    "1": { "vdiv": 0.2, "offset": 0.0, "enabled": true },
-    "2": { "vdiv": 0.2, "offset": 0.0, "enabled": true }
+    "1": { "vdiv": 0.2, "offset": 0.0, "coupling": "DC50", "enabled": true },
+    "2": { "vdiv": 0.2, "offset": 0.0, "coupling": "DC50", "enabled": true }
   },
   "acquisition": {
     "tdiv": 1e-3,
-    "sampling_period": 1e-6
+    "sampling_period": 1e-6,
+    "trigger_delay": 0.0,
+    "window_delay": 10e-9
   },
   "trigger": {
     "channels": {
       "1": { "state": "HIGH", "level": 0.1 },
       "2": { "state": "LOW", "level": -0.05 }
     },
-    "mode": "SINGLE"
-  }
+    "mode": "SINGLE",
+    "external": false,
+    "external_level": 1.25
+  },
+  "sequence": {
+    "enabled": false,
+    "num_segments": 1,
+    "timeout_enabled": false,
+    "timeout_seconds": 2500000.0
+  },
+  "auxiliary_output": "TRIGGER_OUT"
 }
 ```
 
@@ -38,7 +49,14 @@ Edit `settings.json` to customize the oscilloscope configuration:
 |-------|-------------|
 | `channels.<n>.vdiv` | Vertical scale (V/div) |
 | `channels.<n>.offset` | Vertical offset (V) |
+| `channels.<n>.coupling` | Coupling mode: `DC50`, `DC1M`, `AC1M`, or `GND` |
 | `channels.<n>.enabled` | Enable/disable channel |
+
+**Coupling Modes:**
+- `DC50` - 50Ω DC coupling (default)
+- `DC1M` - 1MΩ DC coupling
+- `AC1M` - 1MΩ AC coupling
+- `GND` - Ground
 
 ### Acquisition Settings
 
@@ -46,6 +64,8 @@ Edit `settings.json` to customize the oscilloscope configuration:
 |-------|-------------|
 | `acquisition.tdiv` | Horizontal scale (s/div) |
 | `acquisition.sampling_period` | Sample interval (s) |
+| `acquisition.trigger_delay` | Trigger delay time (s) |
+| `acquisition.window_delay` | Window delay time (s) |
 
 ### Trigger Settings
 
@@ -55,38 +75,56 @@ Edit `settings.json` to customize the oscilloscope configuration:
 | `trigger.channels.<n>.level` | Absolute trigger level (V) |
 | `trigger.channels.<n>.level_offset` | Relative to baseline (V), used if `level` is not set |
 | `trigger.mode` | `SINGLE`, `NORM`, or `AUTO` |
+| `trigger.external` | Enable external trigger input (bool) |
+| `trigger.external_level` | External trigger level (V) |
 
 **Trigger States:**
 - `HIGH` - Trigger on rising edge (high level)
 - `LOW` - Trigger on falling edge (low level)
 - `DONT_CARE` - Don't use this channel for triggering
 
+**External Trigger:**
+When `external` is `true`, the scope will use the external trigger input (EX) in addition to any configured channel triggers. Set `external_level` to specify the threshold voltage.
+
+### Sequence Settings
+
+| Field | Description |
+|-------|-------------|
+| `sequence.enabled` | Enable sequence mode (bool) |
+| `sequence.num_segments` | Number of segments to capture |
+| `sequence.timeout_enabled` | Enable timeout between segments (bool) |
+| `sequence.timeout_seconds` | Timeout duration (s) |
+
+**Sequence Mode:**
+When enabled, the oscilloscope captures multiple waveform segments in a single acquisition. Each segment is triggered independently and stored separately. This is useful for capturing rare events or analyzing signal variations over time.
+
+### Auxiliary Output Settings
+
+| Field | Description |
+|-------|-------------|
+| `auxiliary_output` | Auxiliary output mode: `TRIGGER_OUT` or `TRIGGER_ENABLED` |
+
+**Auxiliary Output Modes:**
+- `TRIGGER_OUT` - Output a pulse when trigger occurs
+- `TRIGGER_ENABLED` - Output high when trigger is armed
+
 ## Running the Example
+
+```bash
+cd examples/02_manual_settings
+```
 
 ### Apply Settings from File
 
 ```bash
 # Default: WavePro at 192.168.0.10, using settings.json
-python -m examples.02_manual_settings.manual_settings
-
-# Keep display on (default: off for faster acquisition)
-python -m examples.02_manual_settings.manual_settings --display
+python manual_settings.py
 
 # Specify model and address
-python -m examples.02_manual_settings.manual_settings --model waverunner --address 192.168.1.100
+python manual_settings.py --model waverunner --address 192.168.1.100
 
 # Use a custom config file
-python -m examples.02_manual_settings.manual_settings --config my_settings.json
-```
-
-### Save Current Settings to File
-
-```bash
-# Save current scope settings to a JSON file
-python -m examples.02_manual_settings.manual_settings --save current_settings.json
-
-# With model/address
-python -m examples.02_manual_settings.manual_settings --model wavepro --address 192.168.0.10 --save backup.json
+python manual_settings.py --config my_settings.json
 ```
 
 ## Expected Output

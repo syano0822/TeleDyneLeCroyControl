@@ -11,11 +11,13 @@ Establish a basic connection to a Teledyne LeCroy oscilloscope and query its ide
 ## Running the Example
 
 ```bash
+cd examples/01_connect
+
 # Default: WavePro at 192.168.0.10
-python -m examples.01_connect.connect
+python connect.py
 
 # Specify model and address
-python -m examples.01_connect.connect --model waverunner --address 192.168.1.100
+python connect.py --model waverunner --address 192.168.1.100
 ```
 
 ## Expected Output

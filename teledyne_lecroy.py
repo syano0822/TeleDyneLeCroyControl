@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pyvisa
@@ -211,8 +211,20 @@ class SequenceData:
         return self.segments[idx]
 
     def to_voltage_array(self) -> NDArray[np.float64]:
-        """Convert all segments to 2D array (n_segments, n_points)."""
-        return np.array([seg.to_voltage() for seg in self.segments])
+        """Convert all segments to 2D array (n_segments, n_points).
+        
+        Trims all segments to the minimum length to ensure a valid 2D array.
+        """
+        arrays = [seg.to_voltage() for seg in self.segments]
+        if not arrays:
+            return np.array([])
+            
+        # Ensure all segments have the same length (trim to min length)
+        min_len = min(len(a) for a in arrays)
+        if any(len(a) != min_len for a in arrays):
+            arrays = [a[:min_len] for a in arrays]
+            
+        return np.array(arrays)
 
 
 # === Base Class ===
@@ -248,6 +260,11 @@ class TeledyneLecroyScope(ABC):
         self._acquisition_config: AcquisitionConfig | None = None
         self._trigger_config: TriggerConfig | None = None
         self._sequence_config: SequenceConfig | None = None
+        self._settings: dict = {}
+
+        # Auto-save settings
+        self._output_dir: Path | None = None
+        self._auto_save_settings: bool = False
 
         # Validate channels
         for ch in self._active_channels:
@@ -280,6 +297,9 @@ class TeledyneLecroyScope(ABC):
 
             idn = self.query("*IDN?")
             self._logger.info(f"Connected: {idn}")
+
+            # Load current settings from scope
+            self._settings = self.read_all_settings()
 
         except pyvisa.Error as e:
             raise ScopeConnectionError(f"Connection failed: {self._address}") from e
@@ -341,51 +361,121 @@ class TeledyneLecroyScope(ABC):
         self._scope.clear()
         self._logger.info("Scope cleared")
 
+    @property
+    def settings(self) -> dict:
+        """Current settings state (read-only copy)."""
+        return self._settings.copy()
+
+    def _update_settings(self, section: str, key: str | None = None, value: Any = None, data: dict | None = None) -> None:
+        """Update internal settings state.
+
+        Args:
+            section: Top-level section (channels, acquisition, trigger, sequence, auxiliary_output)
+            key: Sub-key within section (optional)
+            value: Value to set (used with key)
+            data: Dict to merge into section (used without key)
+        """
+        if section not in self._settings:
+            self._settings[section] = {}
+
+        if data is not None:
+            if isinstance(self._settings[section], dict):
+                self._settings[section].update(data)
+            else:
+                self._settings[section] = data
+        elif key is not None:
+            self._settings[section][key] = value
+        else:
+            self._settings[section] = value
+
+    def print_settings(self) -> None:
+        """Print current settings in a readable format."""
+        import json
+        print(json.dumps(self._settings, indent=2))
+
     # === Configuration ===
 
     def configure(
         self,
-        channels: dict[int, ChannelConfig],
-        acquisition: AcquisitionConfig,
+        channels: dict[int, ChannelConfig] | None = None,
+        acquisition: AcquisitionConfig | None = None,
         sequence: SequenceConfig | None = None,
-        display: bool = False,
+        display: bool | None = None,
     ) -> None:
         """Configure scope with given settings.
 
+        All parameters are optional - only provided settings will be updated.
+
         Args:
-            channels: Channel configurations
+            channels: Channel configurations (partial update supported)
             acquisition: Acquisition/timebase configuration
-            sequence: Optional sequence mode configuration
+            sequence: Sequence mode configuration
             display: Keep display on (True) or off for faster acquisition (False)
         """
-        self._validate_config(channels, acquisition)
-
+        self._ensure_connected()
         self.write("CHDR OFF")  # Remove response headers
-        self._configure_display(display=display)
-        self._configure_timebase(acquisition)
 
-        for ch, cfg in channels.items():
-            if cfg.enabled:
+        # Configure display if specified
+        if display is not None:
+            self._configure_display(display=display)
+
+        # Configure acquisition/timebase if provided
+        if acquisition is not None:
+            self._validate_acquisition(acquisition)
+            self._configure_timebase(acquisition)
+            self._acquisition_config = acquisition
+            self._settings["acquisition"] = {
+                "tdiv": acquisition.tdiv,
+                "sampling_period": acquisition.sampling_period,
+                "trigger_delay": acquisition.trigger_delay,
+                "window_delay": acquisition.window_delay,
+            }
+
+        # Configure channels if provided
+        if channels is not None:
+            self._validate_channels(channels)
+            for ch, cfg in channels.items():
                 self._configure_channel(ch, cfg)
+                # Update internal state
+                if self._channel_configs is None:
+                    self._channel_configs = {}
+                self._channel_configs[ch] = cfg
+                # Update settings state
+                if "channels" not in self._settings:
+                    self._settings["channels"] = {}
+                self._settings["channels"][str(ch)] = {
+                    "vdiv": cfg.vdiv,
+                    "offset": cfg.offset,
+                    "coupling": cfg.coupling.name,
+                    "enabled": cfg.enabled,
+                }
 
-        if sequence and sequence.enabled:
-            self._configure_sequence(sequence)
+        # Configure sequence if provided
+        if sequence is not None:
+            if sequence.enabled:
+                self._configure_sequence(sequence)
+            else:
+                # Explicitly turn off sequence mode
+                self.write("SEQ OFF")
+                self._logger.info("Sequence mode disabled")
+            self._sequence_config = sequence
+            self._settings["sequence"] = {
+                "enabled": sequence.enabled,
+                "num_segments": sequence.num_segments,
+                "timeout_enabled": sequence.timeout_enabled,
+                "timeout_seconds": sequence.timeout_seconds,
+            }
 
-        self._channel_configs = channels
-        self._acquisition_config = acquisition
-        self._sequence_config = sequence
         self._logger.info("Configuration complete")
 
-    def _validate_config(
-        self,
-        channels: dict[int, ChannelConfig],
-        acquisition: AcquisitionConfig,
-    ) -> None:
-        """Validate configuration values."""
+    def _validate_channels(self, channels: dict[int, ChannelConfig]) -> None:
+        """Validate channel configuration values."""
         for ch in channels:
             if not 1 <= ch <= self.MAX_CHANNELS:
                 raise ScopeConfigurationError(f"Invalid channel: {ch}")
 
+    def _validate_acquisition(self, acquisition: AcquisitionConfig) -> None:
+        """Validate acquisition configuration values."""
         max_window = self.TIME_DIVISIONS / 2 * acquisition.tdiv
         if acquisition.window_delay > max_window:
             raise ScopeConfigurationError(
@@ -512,9 +602,28 @@ class TeledyneLecroyScope(ABC):
         for ch in range(1, self.MAX_CHANNELS + 1):
             try:
                 config = self.read_channel_config(ch)
+
+                # Read coupling
+                coupling_str = "DC50"  # default
+                try:
+                    coupling_response = self.query(f"C{ch}:CPL?").strip()
+                    # Parse coupling (e.g., "C1:CPL D50" or "D50")
+                    coupling_value = coupling_response.split()[-1]
+                    # Map to Coupling enum names
+                    coupling_map = {
+                        "D50": "DC50",
+                        "D1M": "DC1M",
+                        "A1M": "AC1M",
+                        "GND": "GND",
+                    }
+                    coupling_str = coupling_map.get(coupling_value, "DC50")
+                except Exception as e:
+                    self._logger.debug(f"Could not read coupling for channel {ch}: {e}")
+
                 channels[str(ch)] = {
                     "vdiv": config.vdiv,
                     "offset": config.offset,
+                    "coupling": coupling_str,
                     "enabled": config.enabled,
                 }
             except Exception as e:
@@ -522,9 +631,28 @@ class TeledyneLecroyScope(ABC):
 
         # Read acquisition settings
         acq = self.read_acquisition_config()
+
+        # Read trigger delay
+        trigger_delay = 0.0
+        try:
+            trigger_delay = self._parse_numeric_response(self.query("TRDL?"))
+        except Exception as e:
+            self._logger.debug(f"Could not read trigger delay: {e}")
+
+        # Read window delay (from waveform setup first point)
+        window_delay = 10e-9  # default
+        try:
+            # Try to get from stored config if available
+            if self._acquisition_config:
+                window_delay = self._acquisition_config.window_delay
+        except Exception as e:
+            self._logger.debug(f"Could not read window delay: {e}")
+
         acquisition = {
             "tdiv": acq.tdiv,
             "sampling_period": acq.sampling_period,
+            "trigger_delay": trigger_delay,
+            "window_delay": window_delay,
         }
 
         # Read trigger mode
@@ -555,23 +683,90 @@ class TeledyneLecroyScope(ABC):
             except Exception as e:
                 self._logger.debug(f"Could not read trigger for channel {ch}: {e}")
 
+        # Read external trigger settings
+        external = False
+        external_level = 1.25  # default
+        try:
+            # Check if external trigger is active in pattern
+            trpa_response = self.query("TRPA?")
+            # Parse for "EX,H" or "EX,L" (not "EX,X")
+            if "EX,H" in trpa_response or "EX,L" in trpa_response:
+                external = True
+
+            # Read external trigger level
+            external_level = self._parse_numeric_response(self.query("EX:TRLV?"))
+        except Exception as e:
+            self._logger.debug(f"Could not read external trigger settings: {e}")
+
         trigger = {
             "channels": trigger_channels,
             "mode": trigger_mode,
+            "external": external,
+            "external_level": external_level,
         }
+
+        # Read sequence configuration
+        sequence = {
+            "enabled": False,
+            "num_segments": 1,
+            "timeout_enabled": False,
+            "timeout_seconds": 2.5e6,
+        }
+        try:
+            seq_response = self.query("SEQ?").strip()
+            # Parse response like "SEQ ON,100,2.5E+6" or "SEQ OFF"
+            if "ON" in seq_response:
+                sequence["enabled"] = True
+                parts = seq_response.replace("SEQ", "").replace("ON", "").strip().split(",")
+                if len(parts) >= 1:
+                    try:
+                        sequence["num_segments"] = int(parts[0].strip())
+                    except ValueError:
+                        pass
+                if len(parts) >= 2:
+                    try:
+                        sequence["timeout_seconds"] = float(parts[1].strip())
+                    except ValueError:
+                        pass
+
+            # Try to read timeout enabled status via VBS
+            try:
+                timeout_response = self.query(
+                    r"""vbs? 'return=app.Acquisition.Horizontal.SequenceTimeoutEnable' """
+                )
+                sequence["timeout_enabled"] = "-1" in timeout_response or "TRUE" in timeout_response.upper()
+            except Exception:
+                pass
+        except Exception as e:
+            self._logger.debug(f"Could not read sequence settings: {e}")
+
+        # Read auxiliary output mode
+        auxiliary_output = "TRIGGER_OUT"  # default
+        try:
+            aux_response = self.query(
+                r"""vbs? 'return=app.Acquisition.AuxOutput.Mode' """
+            ).strip()
+            # Parse response and map to AuxOutputMode enum names
+            if "TriggerEnabled" in aux_response:
+                auxiliary_output = "TRIGGER_ENABLED"
+            elif "TriggerOut" in aux_response:
+                auxiliary_output = "TRIGGER_OUT"
+        except Exception as e:
+            self._logger.debug(f"Could not read auxiliary output: {e}")
 
         return {
             "channels": channels,
             "acquisition": acquisition,
             "trigger": trigger,
+            "sequence": sequence,
+            "auxiliary_output": auxiliary_output,
         }
 
     def save_settings(self, filepath: str | Path) -> None:
         """Save current scope settings to JSON file."""
-        settings = self.read_all_settings()
         filepath = Path(filepath)
         with filepath.open("w") as f:
-            json.dump(settings, f, indent=2)
+            json.dump(self._settings, f, indent=2)
         self._logger.info(f"Settings saved to {filepath}")
 
     @staticmethod
@@ -580,6 +775,110 @@ class TeledyneLecroyScope(ABC):
         filepath = Path(filepath)
         with filepath.open() as f:
             return json.load(f)
+
+    def apply_settings(self, settings: dict) -> None:
+        """Apply settings from a dictionary (e.g., loaded from JSON).
+
+        Converts dict format to typed dataclasses and calls configure().
+        This ensures WFSU parameters are set correctly for the display range.
+
+        Args:
+            settings: Settings dict (from read_all_settings or load_settings_file)
+        """
+        self._ensure_connected()
+
+        # Build channel configs (only enabled channels)
+        channels: dict[int, ChannelConfig] = {}
+        for ch_str, ch_data in settings.get("channels", {}).items():
+            if ch_data.get("enabled", False):
+                coupling = Coupling[ch_data.get("coupling", "DC50")]
+                channels[int(ch_str)] = ChannelConfig(
+                    vdiv=ch_data.get("vdiv", 0.02),
+                    offset=ch_data.get("offset", 0.0),
+                    coupling=coupling,
+                    enabled=True,
+                )
+
+        # Build acquisition config
+        acq_data = settings.get("acquisition", {})
+        acquisition = AcquisitionConfig(
+            tdiv=acq_data.get("tdiv", 5e-9),
+            sampling_period=acq_data.get("sampling_period", 25e-12),
+            trigger_delay=acq_data.get("trigger_delay", 0.0),
+            window_delay=acq_data.get("window_delay", 10e-9),
+        )
+
+        # Build sequence config (always create to ensure SEQ OFF is sent if disabled)
+        seq_data = settings.get("sequence", {})
+        sequence = SequenceConfig(
+            enabled=seq_data.get("enabled", False),
+            num_segments=seq_data.get("num_segments", 1),
+            timeout_enabled=seq_data.get("timeout_enabled", False),
+            timeout_seconds=seq_data.get("timeout_seconds", 2.5e6),
+        )
+
+        # Apply configuration (this sets WFSU for correct data range)
+        self.configure(
+            channels=channels if channels else None,
+            acquisition=acquisition,
+            sequence=sequence,
+        )
+
+        # Apply trigger settings if present
+        trigger_data = settings.get("trigger", {})
+        if trigger_data:
+            trigger_channels: dict[int, ChannelTrigger] = {}
+            for ch_str, tr_data in trigger_data.get("channels", {}).items():
+                state = TriggerState[tr_data.get("state", "DONT_CARE")]
+                trigger_channels[int(ch_str)] = ChannelTrigger(
+                    state=state,
+                    level=tr_data.get("level", 0.0),
+                )
+
+            trigger_config = TriggerConfig(
+                channels=trigger_channels,
+                mode=trigger_data.get("mode", "SINGLE"),
+                external=trigger_data.get("external", False),
+                external_level=trigger_data.get("external_level", 1.25),
+            )
+            self.set_trigger(trigger_config)
+
+        self._logger.info("Settings applied from dictionary")
+
+    def set_output_dir(self, path: str | Path, auto_save: bool = True) -> None:
+        """Set output directory for captured data and auto-saved settings.
+
+        Args:
+            path: Directory path for output files
+            auto_save: If True, automatically save settings on config changes and captures
+        """
+        self._output_dir = Path(path)
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._auto_save_settings = auto_save
+        self._logger.info(f"Output directory set to {self._output_dir}")
+        if auto_save:
+            self._logger.info("Auto-save settings enabled")
+            self._save_settings_snapshot()
+
+    def _save_settings_snapshot(self, suffix: str = "") -> Path | None:
+        """Save current settings to output directory if auto-save is enabled.
+
+        Args:
+            suffix: Optional suffix for filename (e.g., "_capture", "_config")
+
+        Returns:
+            Path to saved file, or None if auto-save disabled
+        """
+        if not self._auto_save_settings or not self._output_dir:
+            return None
+
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"scope_settings_{timestamp}{suffix}.json"
+        filepath = self._output_dir / filename
+        self.save_settings(filepath)
+        self._logger.info(f"Settings auto-saved to {filepath}")
+        return filepath
 
     # === Offset and Auxiliary Output ===
 
@@ -618,6 +917,11 @@ class TeledyneLecroyScope(ABC):
         self.write(f"""vbs 'app.Acquisition.AuxOutput.Mode = "{mode.value}"' """)
         self._logger.info(f"Auxiliary output: {mode.value}")
 
+        # Update settings state
+        self._update_settings("auxiliary_output", value=mode.name)
+
+        self._save_settings_snapshot("_aux")
+
     @abstractmethod
     def _auto_offset_search(self) -> dict[int, float]:
         """Automatically find signal and set offset for each channel."""
@@ -649,6 +953,25 @@ class TeledyneLecroyScope(ABC):
         """Configure sequence mode."""
         ...
 
+    def configure_sequence(self, config: SequenceConfig) -> None:
+        """Configure sequence mode (public method).
+
+        Args:
+            config: Sequence mode configuration
+        """
+        self._configure_sequence(config)
+        self._sequence_config = config
+
+        # Update settings state
+        self._settings["sequence"] = {
+            "enabled": config.enabled,
+            "num_segments": config.num_segments,
+            "timeout_enabled": config.timeout_enabled,
+            "timeout_seconds": config.timeout_seconds,
+        }
+
+        self._save_settings_snapshot("_sequence")
+
     # === Trigger ===
 
     def set_trigger(self, config: TriggerConfig) -> None:
@@ -662,8 +985,32 @@ class TeledyneLecroyScope(ABC):
                   if t.state != TriggerState.DONT_CARE]
         self._logger.info(f"Trigger configured: {', '.join(active) or 'none'}")
 
+        # Update settings state - trigger
+        trigger_channels = {}
+        for ch, ch_trig in config.channels.items():
+            # Calculate actual level (absolute or relative)
+            if ch_trig.level is not None:
+                level = ch_trig.level
+            else:
+                level = ch_trig.level_offset  # Store offset value
+
+            trigger_channels[str(ch)] = {
+                "state": ch_trig.state.name,
+                "level": level,
+            }
+
+        self._settings["trigger"] = {
+            "channels": trigger_channels,
+            "mode": config.mode,
+            "external": config.external,
+            "external_level": config.external_level,
+        }
+
+        self._save_settings_snapshot("_trigger")
+
     def arm(self, force: bool = False) -> None:
         """Arm trigger and wait for acquisition."""
+        self._save_settings_snapshot("_capture")
         if force:
             self.write("TRMD NORM")
             self.write("FRTR")  # Force trigger
@@ -726,6 +1073,11 @@ class TeledyneLecroyScope(ABC):
         self.write(f"TRMD {mode}")
         self._logger.debug(f"Trigger mode: {mode}")
 
+        # Update settings state
+        if "trigger" not in self._settings:
+            self._settings["trigger"] = {}
+        self._settings["trigger"]["mode"] = mode
+
     @abstractmethod
     def _setup_trigger_source(self, config: TriggerConfig) -> None:
         """Setup trigger source and slope."""
@@ -750,20 +1102,67 @@ class TeledyneLecroyScope(ABC):
 
         trigger_time = self._get_trigger_time()
 
-        for ch in channels:
-            raw = self._read_channel_data(ch)
-            dx, x0, dy, y0 = self._get_waveform_scaling(ch)
+        # Re-enforce WFSU before reading to ensure data size is correct
+        if self._acquisition_config:
+            acq = self._acquisition_config
+            num_points = self._calculate_num_points(acq)
+            
+            for ch in channels:
+                # 0. Reset WFSU to see full memory
+                # NP=0 means "all points", SP=1 means "no sparsification"
+                self.write(f"C{ch}:WFSU SP,1,NP,0,FP,0,SN,0")
 
-            result[ch] = WaveformData(
-                raw_data=raw,
-                channel=ch,
-                segment=0,
-                dx=dx,
-                x0=x0,
-                dy=dy,
-                y0=y0,
-                trigger_time=trigger_time,
-            )
+                # 1. Check what the scope actually captured
+                inspect = self.query(f"C{ch}:INSPECT? 'WAVEDESC'")
+                
+                # Parse WAVE_ARRAY_COUNT
+                actual_points = 0
+                import re
+                match = re.search(r"WAVE_ARRAY_COUNT\s*:\s*(\d+)", inspect)
+                if match:
+                    actual_points = int(match.group(1))
+                
+                # Debug print for diagnosis
+                print(f"  [DEBUG] CH{ch}: Actual={actual_points}, Target={num_points}")
+
+                # 2. Calculate sparsification
+                sparsification = 1
+                if actual_points > 0:
+                    sparsification = max(1, int(actual_points / num_points))
+                
+                print(f"  [DEBUG] CH{ch}: Calculated SP={sparsification}")
+
+                # 3. Configure WFSU with SP
+                # Reset FP to 0 to ensure we start from the beginning of the buffer
+                first_point = 0 
+
+                self._logger.debug(f"CH{ch}: Actual={actual_points}, Target={num_points}, SP={sparsification}")
+                
+                # Note: We request num_points. If SP=100, scope sends num_points * SP range decimated.
+                self.write(f"C{ch}:WFSU SP,{sparsification},NP,{num_points},FP,{first_point},SN,0")
+                
+                # Small delay to ensure setting sticks
+                import time
+                time.sleep(0.05)
+
+                # 4. Read data
+                raw = self._read_channel_data(ch, count=num_points)
+                dx, x0, dy, y0 = self._get_waveform_scaling(ch)
+                
+                # If sparsified, adjust dx (time step)
+                if sparsification > 1:
+                     dx *= sparsification
+
+                result[ch] = WaveformData(
+                    raw_data=raw,
+                    channel=ch,
+                    segment=0,
+                    dx=dx,
+                    x0=x0,
+                    dy=dy,
+                    y0=y0,
+                    trigger_time=trigger_time,
+                )
 
         self._logger.debug(f"Readout complete: channels {channels}")
         return result
@@ -786,8 +1185,14 @@ class TeledyneLecroyScope(ABC):
         return result
 
     @abstractmethod
-    def _read_channel_data(self, channel: int) -> bytes:
-        """Read raw waveform data from channel."""
+    def _read_channel_data(self, channel: int, offset: int = 0, count: int = 0) -> bytes:
+        """Read raw waveform data from channel.
+        
+        Args:
+            channel: Channel number
+            offset: Start index (0-based)
+            count: Number of points to read (0 = all)
+        """
         ...
 
     @abstractmethod
@@ -820,6 +1225,10 @@ class WavePro(TeledyneLecroyScope):
 
     def _configure_display(self, display: bool = False) -> None:
         """Configure display for remote operation."""
+        # Reset scope to factory defaults for clean state
+        self.write("*RST")
+        self.wait_opc()
+
         if display:
             self.write("DISP ON")
         else:
@@ -838,8 +1247,27 @@ class WavePro(TeledyneLecroyScope):
         self.write(f"TDIV {config.tdiv}")
         self.write(f"TRDL {config.trigger_delay}")
 
+        # Set sample rate explicitly via VBS to ensure scope doesn't use higher rate
+        # This MUST be done after TDIV/MSIZ commands, as they might reset the sample rate
+        desired_sr = 1.0 / config.sampling_period
+        print(f"  [DEBUG] Setting SampleRate to {desired_sr:.0e}")
+        self.write(fr"""vbs 'app.Acquisition.Horizontal.SampleRate = {desired_sr}' """)
+
+        sr_after = self.query(r"""vbs? 'return=app.Acquisition.Horizontal.SampleRate' """)
+        print(f"  [DEBUG] SampleRate (after VBS) -> {sr_after.strip()}")
+
+        # Verify TDIV and MSIZ actually stuck
+        actual_tdiv = self.query("TDIV?")
+        actual_msiz = self.query("MSIZ?")
+        print(f"  [DEBUG] Config check: TDIV={actual_tdiv.strip()}, MSIZ={actual_msiz.strip()}")
+
+        # Check VBS internal values
+        vbs_npts = self.query(r"""vbs? 'return=app.Acquisition.Horizontal.NumPoints' """)
+        print(f"  [DEBUG] VBS NumPoints: {vbs_npts.strip()}")
+
         # Waveform setup for all channels
         num_points = self._calculate_num_points(config)
+        print(f"  [DEBUG] Calculated num_points for WFSU: {num_points}")
         sparsification = 1
         first_point = int(
             config.window_delay / config.sampling_period
@@ -1051,10 +1479,60 @@ class WavePro(TeledyneLecroyScope):
         )
         return 0.0
 
-    def _read_channel_data(self, channel: int) -> bytes:
-        """Read raw waveform data."""
-        self.write(f"C{channel}:WF? DAT1")
-        return self.read_raw()
+    def _read_channel_data(self, channel: int, offset: int = 0, count: int = 0) -> bytes:
+        """Read raw waveform data.
+
+        Strips IEEE 488.2 definite-length binary block header:
+        Format: #<n><length><data><terminator>
+        where <n> is digit count, <length> is byte count in <n> digits
+        """
+        if count > 0:
+            # Request specific range: DAT1,NO,<offset>,NP,<count>
+            cmd = f"C{channel}:WF? DAT1,NO,{offset},NP,{count}"
+        else:
+            # Request all data (relies on WFSU or default)
+            cmd = f"C{channel}:WF? DAT1"
+            
+        self.write(cmd)
+        raw = self.read_raw()
+        return self._strip_binary_header(raw)
+
+    def _strip_binary_header(self, data: bytes) -> bytes:
+        """Strip IEEE 488.2 binary block header from raw data.
+
+        Args:
+            data: Raw bytes including header
+
+        Returns:
+            Waveform data with header and terminator removed
+        """
+        # Find the '#' character that starts the header
+        try:
+            hash_idx = data.index(b"#")
+        except ValueError:
+            # No header found, return as-is
+            self._logger.warning("No binary block header found in data")
+            return data
+
+        # Next byte is the digit count (ASCII digit)
+        digit_count = int(chr(data[hash_idx + 1]))
+        if digit_count == 0:
+            # Indefinite length block (terminated by newline)
+            return data[hash_idx + 2 : -1]
+
+        # Read the byte count
+        byte_count_start = hash_idx + 2
+        byte_count_end = byte_count_start + digit_count
+        byte_count_str = data[byte_count_start:byte_count_end].decode("ascii")
+        byte_count = int(byte_count_str)
+
+        # Debug header info
+        # print(f"  [DEBUG-HEADER] Header: {data[hash_idx:byte_count_end].decode('ascii')} | Calc Count: {byte_count} | Total Len: {len(data)}")
+
+        # Extract only the waveform data
+        data_start = byte_count_end
+        data_end = data_start + byte_count
+        return data[data_start:data_end]
 
     def _get_waveform_scaling(
         self, channel: int
@@ -1094,22 +1572,50 @@ class WavePro(TeledyneLecroyScope):
 
     def _read_sequence_segments(self, channel: int) -> list[WaveformData]:
         """Read all sequence segments."""
-        if not self._sequence_config:
+        if not self._sequence_config or not self._acquisition_config:
             return []
 
         segments: list[WaveformData] = []
+        
+        # Calculate target points per segment
+        num_points = self._calculate_num_points(self._acquisition_config)
+        
+        # Need to get scaling once
         dx, x0, dy, y0 = self._get_waveform_scaling(channel)
 
         for seg_idx in range(self._sequence_config.num_segments):
-            self.write(f"C{channel}:WFSU SN,{seg_idx}")
-            raw = self._read_channel_data(channel)
+            # 1. Reset WFSU to see full raw data for this segment
+            self.write(f"C{channel}:WFSU SP,1,NP,0,FP,0,SN,{seg_idx}")
+            
+            # 2. Check actual points for THIS segment
+            inspect = self.query(f"C{channel}:INSPECT? 'WAVEDESC'")
+            actual_points = 0
+            import re
+            match = re.search(r"WAVE_ARRAY_COUNT\s*:\s*(\d+)", inspect)
+            if match:
+                 actual_points = int(match.group(1))
+            
+            # 3. Calculate SP for THIS segment
+            sparsification = 1
+            if actual_points > 0:
+                sparsification = max(1, int(actual_points / num_points))
+            
+            # 4. Configure WFSU for this segment
+            self.write(f"C{channel}:WFSU SP,{sparsification},NP,{num_points},FP,0,SN,{seg_idx}")
+            
+            raw = self._read_channel_data(channel, count=num_points)
+            
+            # Adjust dx for this segment
+            seg_dx = dx
+            if sparsification > 1:
+                seg_dx *= sparsification
 
             segments.append(
                 WaveformData(
                     raw_data=raw,
                     channel=channel,
                     segment=seg_idx,
-                    dx=dx,
+                    dx=seg_dx,
                     x0=x0,
                     dy=dy,
                     y0=y0,
