@@ -114,55 +114,81 @@ When enabled, the oscilloscope captures multiple waveform segments in a single a
 cd examples/02_manual_settings
 ```
 
-### Apply Settings from File
+### Save Current Settings (Read Mode)
+
+Without `--config`, the script reads current scope settings and saves to a file:
 
 ```bash
-# Default: WavePro at 192.168.0.10, using settings.json
+# Save to settings.json (default), prompts if file exists
 python manual_settings.py
+
+# Force overwrite without confirmation
+python manual_settings.py -f
+
+# Save to custom output path
+python manual_settings.py --output my_settings.json
 
 # Specify model and address
 python manual_settings.py --model waverunner --address 192.168.1.100
+```
 
-# Use a custom config file
+### Apply Settings from File (Apply Mode)
+
+With `--config`, the script applies settings from the specified file:
+
+```bash
+# Apply from settings.json
+python manual_settings.py --config settings.json
+
+# Apply from custom file
 python manual_settings.py --config my_settings.json
+
+# Partial config - only apply trigger settings
+python manual_settings.py --config trigger_only.json
+```
+
+### Partial Configuration Files
+
+The script supports partial config files. Only sections present in the JSON file are applied; missing sections are left unchanged on the scope. For example, to change only the trigger settings:
+
+```json
+{
+  "trigger": {
+    "channels": {
+      "1": { "state": "HIGH", "level": 0.5 }
+    },
+    "mode": "SINGLE"
+  }
+}
 ```
 
 ## Expected Output
 
-### When Applying Settings
-
-```
-Loading settings from: .../settings.json
-Manual settings applied.
-Display: ON
-Channels: [1, 2]
-TDIV: 0.001 s/div
-Trigger:
-  CH1: HIGH, level=0.1
-  CH2: LOW, level=-0.05
-Verify changes on the scope front panel.
-```
-
 ### When Saving Settings
 
 ```
-Reading current settings from scope...
-Settings saved to: current_settings.json
+Settings saved to: settings.json
+```
 
-Channels:
-  CH1: 200.0 mV/div, offset=0.000 V [ON]
-  CH2: 200.0 mV/div, offset=0.000 V [ON]
-  CH3: 500.0 mV/div, offset=0.000 V [OFF]
-  CH4: 500.0 mV/div, offset=0.000 V [OFF]
+If the output file already exists:
+```
+'settings.json' exists. Overwrite? [y/N]: y
+Settings saved to: settings.json
+```
 
-Acquisition:
-  TDIV: 0.001 s/div
+### When Applying Settings
 
-Trigger (SINGLE):
-  CH1: HIGH, level=0.1000 V
-  CH2: LOW, level=-0.0500 V
-  CH3: DONT_CARE, level=0.0000 V
-  CH4: DONT_CARE, level=0.0000 V
+```
+Loading settings from: settings.json
+Applying sections: channels, acquisition, trigger, sequence, auxiliary_output
+Settings applied. Verify changes on the scope front panel.
+```
+
+For partial configs:
+```
+Loading settings from: trigger_only.json
+Applying sections: trigger
+Settings applied. Verify changes on the scope front panel.
 ```
 
 ## Expected Behavior on the Scope
@@ -177,5 +203,4 @@ After running this script, verify on the oscilloscope front panel:
 
 - **JSON parse error**: Validate your settings.json syntax
 - **Configuration errors**: Ensure the scope supports the requested settings
-- **Display off**: Use `--display` flag to keep the display on
 - **Trigger not working**: Check trigger levels are within signal range
