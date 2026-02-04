@@ -145,8 +145,10 @@ def main() -> None:
             print(f"Capturing channels: {channels}")
             print(f"Arming for sequence capture ({args.segments} segments)...")
 
+            # Force NORM mode - re-arms after each trigger (needed for multi-segment capture)
+            scope.set_trigger_mode("NORM")
+
             with timed("arm"):
-                scope.set_trigger_mode("NORM")  # Force NORM mode for sequence capture
                 scope.arm()
 
             with timed("wait_for_trigger"):

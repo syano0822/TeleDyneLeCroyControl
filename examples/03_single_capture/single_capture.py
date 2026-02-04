@@ -133,9 +133,11 @@ def main() -> None:
             print(f"Capturing channels: {channels}")
             print("Arming for single capture...")
 
+            # Force SINGLE mode - triggers once then stops (TRMD? returns "STOP")
+            # This ensures is_triggered() works regardless of settings.json trigger.mode
+            scope.set_trigger_mode("SINGLE")
+
             with timed("arm"):
-                scope.set_trigger_mode("SINGLE")  # Force SINGLE mode for single capture
-                print("trigger mode is forced to 'SINGLE' for the single measurment")
                 scope.arm()
 
             with timed("wait_for_trigger"):
