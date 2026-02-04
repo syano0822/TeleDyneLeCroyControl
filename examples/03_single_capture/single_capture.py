@@ -134,6 +134,8 @@ def main() -> None:
             print("Arming for single capture...")
 
             with timed("arm"):
+                scope.set_trigger_mode("SINGLE")  # Force SINGLE mode for single capture
+                print("trigger mode is forced to 'SINGLE' for the single measurment")
                 scope.arm()
 
             with timed("wait_for_trigger"):
