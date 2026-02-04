@@ -146,6 +146,7 @@ def main() -> None:
             print(f"Arming for sequence capture ({args.segments} segments)...")
 
             with timed("arm"):
+                scope.set_trigger_mode("NORM")  # Force NORM mode for sequence capture
                 scope.arm()
 
             with timed("wait_for_trigger"):
