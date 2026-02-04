@@ -32,6 +32,9 @@ def plot_waveform(waveform: WaveformData, output_path: str, title: str) -> None:
     """Plot and save waveform data as PNG."""
     t = waveform.to_time()
     v = waveform.to_voltage()
+    if v.size == 0:
+        print(f"CH{waveform.channel} seg{waveform.segment}: empty waveform, skip plot")
+        return
     print(
         f"CH{waveform.channel} stats: min={v.min():.3f} V, "
         f"max={v.max():.3f} V, mean={v.mean():.3f} V, p2p={(v.max()-v.min()):.3f} V"
@@ -99,6 +102,12 @@ def parse_args():
         action="store_true",
         help="Use force trigger for testing without real signals",
     )
+    p.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=None,
+        help="Wait timeout in seconds (default: use settings.sequence.timeout_seconds if available)",
+    )
     return p.parse_args()
 
 
@@ -144,6 +153,10 @@ def main() -> None:
 
             print(f"Capturing channels: {channels}")
             print(f"Arming for sequence capture ({args.segments} segments)...")
+            wait_timeout = args.wait_timeout
+            if wait_timeout is None:
+                wait_timeout = float(settings.get("sequence", {}).get("timeout_seconds", 10.0))
+            print(f"Wait timeout: {wait_timeout:.1f}s")
 
             # Force NORM mode - re-arms after each trigger (needed for multi-segment capture)
             scope.set_trigger_mode("NORM")
@@ -152,7 +165,7 @@ def main() -> None:
                 scope.arm()
 
             with timed("wait_for_trigger"):
-                scope.wait_for_trigger(timeout=10.0, force=args.force)
+                scope.wait_for_trigger(timeout=wait_timeout, force=args.force)
             print("Triggered.")
 
             with timed("readout_sequence"):

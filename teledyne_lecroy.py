@@ -1627,6 +1627,13 @@ class WavePro(TeledyneLecroyScope):
             match = re.search(r"WAVE_ARRAY_COUNT\s*:\s*(\d+)", inspect)
             if match:
                  actual_points = int(match.group(1))
+
+            # Sequence timeout/partial capture: no more captured segments.
+            if actual_points <= 0:
+                self._logger.debug(
+                    f"CH{channel}: stopping sequence read at segment {seg_idx} (no data)"
+                )
+                break
             
             # 3. Calculate SP for THIS segment
             sparsification = 1
@@ -1636,7 +1643,8 @@ class WavePro(TeledyneLecroyScope):
             # 4. Configure WFSU for this segment
             self.write(f"C{channel}:WFSU SP,{sparsification},NP,{num_points},FP,0,SN,{seg_idx}")
             
-            raw = self._read_channel_data(channel, count=num_points)
+            read_count = min(num_points, actual_points)
+            raw = self._read_channel_data(channel, count=read_count)
             
             # Adjust dx for this segment
             seg_dx = dx
