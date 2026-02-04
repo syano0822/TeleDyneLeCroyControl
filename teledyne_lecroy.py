@@ -1039,6 +1039,8 @@ class TeledyneLecroyScope(ABC):
     def arm(self, force: bool = False) -> None:
         """Arm trigger and wait for acquisition."""
         self._save_settings_snapshot("_capture")
+        # Clear previous sweep/waveform data before starting a new acquisition.
+        self.write("CLSW")
         if force:
             self.write("TRMD NORM")
             self.write("FRTR")  # Force trigger
