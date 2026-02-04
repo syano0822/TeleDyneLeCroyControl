@@ -1075,19 +1075,22 @@ class TeledyneLecroyScope(ABC):
             self._logger.debug(f"Forced {num_segments} triggers for sequence capture")
             return
 
-        # For sequence mode, use WAIT command which blocks until all segments captured
+        # For sequence mode, poll for completion instead of blocking WAIT
+        # This allows graceful timeout with partial data recovery
         if self._sequence_config and self._sequence_config.enabled:
-            old_timeout = self._scope.timeout
-            if timeout:
-                self._scope.timeout = int(timeout * 1000)  # Convert to ms
-            try:
-                self.write("WAIT")
-                self.wait_opc()
-                self._logger.debug("Sequence acquisition complete")
-            except Exception as e:
-                raise ScopeTimeoutError(f"Trigger timeout: {timeout}s") from e
-            finally:
-                self._scope.timeout = old_timeout
+            while True:
+                # Check if acquisition is complete (TRMD returns STOP when done)
+                trmd = self.query("TRMD?")
+                if "STOP" in trmd:
+                    self._logger.debug("Sequence acquisition complete")
+                    break
+                if timeout and (time.time() - start) > timeout:
+                    # Timeout: stop acquisition and keep partial data
+                    self.write("TRMD STOP")
+                    self.wait_opc()
+                    self._logger.warning(f"Sequence timeout after {timeout}s - partial data available")
+                    break
+                time.sleep(0.01)
             return
 
         # For normal mode, poll TRMD status
