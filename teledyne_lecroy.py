@@ -30,6 +30,8 @@ __all__ = [
     "TriggerState",
     "Coupling",
     "AuxOutputMode",
+    # Constants
+    "SETTINGS_OPTIONS",
     # Exceptions
     "ScopeError",
     "ScopeConnectionError",
@@ -77,6 +79,16 @@ class AuxOutputMode(Enum):
     """Auxiliary output mode."""
     TRIGGER_OUT = "TriggerOut"           # Output trigger pulse
     TRIGGER_ENABLED = "TriggerEnabled"   # Output when trigger is armed/enabled
+
+
+# Settings options metadata for JSON export
+# Maps setting names to their valid string values
+SETTINGS_OPTIONS = {
+    "coupling": [e.name for e in Coupling],
+    "trigger_state": [e.name for e in TriggerState],
+    "trigger_mode": ["AUTO", "NORM", "SINGLE", "STOP"],
+    "auxiliary_output": [e.name for e in AuxOutputMode],
+}
 
 
 # === Exceptions ===
@@ -755,6 +767,7 @@ class TeledyneLecroyScope(ABC):
             self._logger.debug(f"Could not read auxiliary output: {e}")
 
         return {
+            "_options": SETTINGS_OPTIONS,
             "channels": channels,
             "acquisition": acquisition,
             "trigger": trigger,
@@ -782,51 +795,61 @@ class TeledyneLecroyScope(ABC):
         Converts dict format to typed dataclasses and calls configure().
         This ensures WFSU parameters are set correctly for the display range.
 
+        Supports partial configs: only sections present in the dict are applied.
+        Missing sections are left unchanged on the scope.
+
         Args:
             settings: Settings dict (from read_all_settings or load_settings_file)
         """
         self._ensure_connected()
 
-        # Build channel configs (only enabled channels)
-        channels: dict[int, ChannelConfig] = {}
-        for ch_str, ch_data in settings.get("channels", {}).items():
-            if ch_data.get("enabled", False):
-                coupling = Coupling[ch_data.get("coupling", "DC50")]
-                channels[int(ch_str)] = ChannelConfig(
-                    vdiv=ch_data.get("vdiv", 0.02),
-                    offset=ch_data.get("offset", 0.0),
-                    coupling=coupling,
-                    enabled=True,
-                )
+        # Build channel configs only if "channels" section is present
+        channels: dict[int, ChannelConfig] | None = None
+        if "channels" in settings:
+            channels = {}
+            for ch_str, ch_data in settings["channels"].items():
+                if ch_data.get("enabled", False):
+                    coupling = Coupling[ch_data.get("coupling", "DC50")]
+                    channels[int(ch_str)] = ChannelConfig(
+                        vdiv=ch_data.get("vdiv", 0.02),
+                        offset=ch_data.get("offset", 0.0),
+                        coupling=coupling,
+                        enabled=True,
+                    )
 
-        # Build acquisition config
-        acq_data = settings.get("acquisition", {})
-        acquisition = AcquisitionConfig(
-            tdiv=acq_data.get("tdiv", 5e-9),
-            sampling_period=acq_data.get("sampling_period", 25e-12),
-            trigger_delay=acq_data.get("trigger_delay", 0.0),
-            window_delay=acq_data.get("window_delay", 10e-9),
-        )
+        # Build acquisition config only if "acquisition" section is present
+        acquisition: AcquisitionConfig | None = None
+        if "acquisition" in settings:
+            acq_data = settings["acquisition"]
+            acquisition = AcquisitionConfig(
+                tdiv=acq_data.get("tdiv", 5e-9),
+                sampling_period=acq_data.get("sampling_period", 25e-12),
+                trigger_delay=acq_data.get("trigger_delay", 0.0),
+                window_delay=acq_data.get("window_delay", 10e-9),
+            )
 
-        # Build sequence config (always create to ensure SEQ OFF is sent if disabled)
-        seq_data = settings.get("sequence", {})
-        sequence = SequenceConfig(
-            enabled=seq_data.get("enabled", False),
-            num_segments=seq_data.get("num_segments", 1),
-            timeout_enabled=seq_data.get("timeout_enabled", False),
-            timeout_seconds=seq_data.get("timeout_seconds", 2.5e6),
-        )
+        # Build sequence config only if "sequence" section is present
+        sequence: SequenceConfig | None = None
+        if "sequence" in settings:
+            seq_data = settings["sequence"]
+            sequence = SequenceConfig(
+                enabled=seq_data.get("enabled", False),
+                num_segments=seq_data.get("num_segments", 1),
+                timeout_enabled=seq_data.get("timeout_enabled", False),
+                timeout_seconds=seq_data.get("timeout_seconds", 2.5e6),
+            )
 
-        # Apply configuration (this sets WFSU for correct data range)
-        self.configure(
-            channels=channels if channels else None,
-            acquisition=acquisition,
-            sequence=sequence,
-        )
+        # Apply configuration if any section is present
+        if channels is not None or acquisition is not None or sequence is not None:
+            self.configure(
+                channels=channels,
+                acquisition=acquisition,
+                sequence=sequence,
+            )
 
         # Apply trigger settings if present
-        trigger_data = settings.get("trigger", {})
-        if trigger_data:
+        if "trigger" in settings:
+            trigger_data = settings["trigger"]
             trigger_channels: dict[int, ChannelTrigger] = {}
             for ch_str, tr_data in trigger_data.get("channels", {}).items():
                 state = TriggerState[tr_data.get("state", "DONT_CARE")]
@@ -842,6 +865,11 @@ class TeledyneLecroyScope(ABC):
                 external_level=trigger_data.get("external_level", 1.25),
             )
             self.set_trigger(trigger_config)
+
+        # Apply auxiliary output if present
+        if "auxiliary_output" in settings:
+            aux_mode = AuxOutputMode[settings["auxiliary_output"]]
+            self.set_auxiliary_output(aux_mode)
 
         self._logger.info("Settings applied from dictionary")
 
