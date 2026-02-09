@@ -10,13 +10,24 @@
 # Added:
 #  - IP -> NAME mapping from config.json (scope_profile.scope_names)
 #  - Output filename: snapshots/<MODEL>_<NAME>_<runXXXXXX>.json (fallback to timestamp)
-
+#
+# Status (diagnostic) support:
+#  - SCPI state probes (TRIG_MODE?, TRIG_SELECT?, TRIG_PATTERN?, ...)
+#  - Optional VBS Acquire probe:
+#       app.Acquisition.Acquire(timeoutSeconds, forceTriggerOnTimeout)
+#
+# NEW:
+#  - Auto channel count selection by model:
+#       WP... (WavePro)    -> 4ch
+#       WR... (WaveRunner) -> 8ch
+#    CLI --channels-max overrides everything.
+#
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +79,54 @@ def extract_run_tag_from_title(title: Optional[str]) -> Optional[str]:
 
 
 # -----------------------------
+# Channel count inference
+# -----------------------------
+def infer_channels_max_from_model(model: str, family: str) -> Optional[int]:
+    m = (model or "").upper().strip()
+    f = (family or "").upper().strip()
+
+    # Typical model examples:
+    #   WP804HD  -> WavePro, 4ch
+    #   WR8208HD -> WaveRunner, 8ch
+    if m.startswith("WP"):
+        return 4
+    if m.startswith("WR"):
+        return 8
+
+    # Fallback: family string if populated
+    if "WAVEPRO" in f:
+        return 4
+    if "WAVERUNNER" in f:
+        return 8
+
+    return None
+
+
+def get_channels_max(
+    cfg: Dict[str, Any],
+    override: Optional[int],
+    scope: Optional[LeCroyVisa] = None,
+) -> int:
+    # Highest priority: CLI override
+    if override is not None:
+        return int(override)
+
+    # Next: infer from connected scope model (best)
+    if scope is not None:
+        inferred = infer_channels_max_from_model(getattr(scope, "model", ""), getattr(scope, "family", ""))
+        if inferred is not None:
+            return int(inferred)
+
+    # Next: config default
+    v = cfg.get("scope_profile", {}).get("channels_max", None)
+    if v is not None:
+        return int(v)
+
+    # Final fallback
+    return 8
+
+
+# -----------------------------
 # Helpers: VBS read with robust unsupported detection
 # -----------------------------
 def is_unsupported(raw: Optional[str]) -> Tuple[bool, str]:
@@ -96,6 +155,30 @@ def safe_read_key(scope: LeCroyVisa, key: str) -> Tuple[Optional[str], Optional[
         return str(raw).strip(), None
     except Exception as e:
         return None, {"key": key, "path": vbs_path, "reason": f"{type(e).__name__}: {e}"}
+
+
+def safe_scpi_query(scope: LeCroyVisa, cmd: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        v = scope.query(cmd)
+        if v is None:
+            return None, "no return"
+        s = str(v).strip()
+        if s == "":
+            return None, "empty return"
+        return s, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def safe_vbs_get_raw(scope: LeCroyVisa, vbs_path: str) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        raw = scope.vbs_get(vbs_path)
+        bad, reason = is_unsupported(raw)
+        if bad:
+            return None, reason
+        return str(raw).strip(), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 # -----------------------------
@@ -134,12 +217,6 @@ class Snapshot:
 # -----------------------------
 # Build target key list
 # -----------------------------
-def get_channels_max(cfg: Dict[str, Any], override: Optional[int]) -> int:
-    if override is not None:
-        return int(override)
-    return int(cfg.get("scope_profile", {}).get("channels_max", 8))
-
-
 def build_keys(cfg: Dict[str, Any], channels_max: int, only: str) -> List[str]:
     only = only.lower()
     include_all = (only == "all")
@@ -186,7 +263,7 @@ def build_keys(cfg: Dict[str, Any], channels_max: int, only: str) -> List[str]:
             "save.save_to",
             "save.waveform_dir",
             "save.wave_format",
-            "save.trace_title",   # <- resolved prefix is expected here if apply_config set it
+            "save.trace_title",
             "save.save_source",
         ]
 
@@ -201,6 +278,74 @@ def build_keys(cfg: Dict[str, Any], channels_max: int, only: str) -> List[str]:
 
 
 # -----------------------------
+# Status collection
+# -----------------------------
+def collect_status(
+    scope: LeCroyVisa,
+    do_probe_acquire: bool,
+    probe_timeout_s: float,
+    probe_force: bool,
+) -> Tuple[Dict[str, Any], List[Dict[str, str]]]:
+    status: Dict[str, Any] = {}
+    miss: List[Dict[str, str]] = []
+
+    # SCPI probes (read-only)
+    scpi_cmds = [
+        "TRIG_MODE?",
+        "TRIG_STATE?",
+        "TRIG_SELECT?",
+        "TRIG_PATTERN?",
+        "COMM_HEADER?",
+        "COMM_FORMAT?",
+        "COMM_ORDER?",
+    ]
+    for cmd in scpi_cmds:
+        v, err = safe_scpi_query(scope, cmd)
+        key = f"status.scpi.{cmd.replace('?', '').lower()}"
+        if v is not None:
+            status[key] = v
+        else:
+            miss.append({"key": key, "path": cmd, "reason": err or "unavailable"})
+
+    # VBS probes (best-effort)
+    vbs_candidates = [
+        "app.Acquisition.State",
+        "app.Acquisition.RunState",
+        "app.Acquisition.IsRunning",
+        "app.Acquisition.TriggerState",
+        "app.Acquisition.Horizontal.SampleMode",
+        "app.Acquisition.Horizontal.NumSegments",
+        "app.Acquisition.Horizontal.SequenceTimeout",
+        "app.Acquisition.Horizontal.SequenceTimeoutEnable",
+    ]
+    for path in vbs_candidates:
+        v, err = safe_vbs_get_raw(scope, path)
+        key = f"status.vbs.{path.replace('app.', '').lower()}"
+        if v is not None:
+            status[key] = v
+        else:
+            miss.append({"key": key, "path": path, "reason": err or "unavailable"})
+
+    # Optional Acquire probe (side effects)
+    if do_probe_acquire:
+        vbs = f"app.Acquisition.Acquire({float(probe_timeout_s)}, {int(bool(probe_force))})"
+        t0 = time.time()
+        try:
+            ret = scope.vbs_call(vbs)
+            dt = time.time() - t0
+            status["status.probe.acquire.vbs"] = vbs
+            status["status.probe.acquire.dt_seconds"] = round(dt, 6)
+            status["status.probe.acquire.return_raw"] = "" if ret is None else str(ret).strip()
+        except Exception as e:
+            dt = time.time() - t0
+            status["status.probe.acquire.vbs"] = vbs
+            status["status.probe.acquire.dt_seconds"] = round(dt, 6)
+            miss.append({"key": "status.probe.acquire", "path": vbs, "reason": f"{type(e).__name__}: {e}"})
+
+    return status, miss
+
+
+# -----------------------------
 # Pretty printing helpers
 # -----------------------------
 def _fmt_kv(k: str, v: Any, pad: int) -> str:
@@ -208,11 +353,12 @@ def _fmt_kv(k: str, v: Any, pad: int) -> str:
     return f"{k:<{pad}} : {s}"
 
 
-def print_header(scope: LeCroyVisa, ip: str, scope_name: str) -> None:
+def print_header(scope: LeCroyVisa, ip: str, scope_name: str, channels_max: int) -> None:
     print(f"Connected: {scope.idn()}")
     print(f"Model    : {scope.model}   Family: {scope.family}")
     print(f"IP       : {ip}")
     print(f"Name     : {scope_name}")
+    print(f"Channels : {channels_max} (auto; use --channels-max to override)")
 
 
 def print_group(title: str, items: List[Tuple[str, Any]]) -> None:
@@ -238,6 +384,7 @@ def group_items(readback_human: Dict[str, Any], only: str, trigger_view: str) ->
     trigger_view = trigger_view.lower()
 
     groups: Dict[str, List[Tuple[str, Any]]] = {
+        "Status": [],
         "Trigger": [],
         "Horizontal": [],
         "Channels": [],
@@ -248,6 +395,11 @@ def group_items(readback_human: Dict[str, Any], only: str, trigger_view: str) ->
     def add(group: str, key: str, label: str) -> None:
         if key in readback_human:
             groups[group].append((label, readback_human.get(key)))
+
+    # Status
+    for k in sorted(readback_human.keys()):
+        if k.startswith("status."):
+            groups["Status"].append((k.replace("status.", ""), readback_human.get(k)))
 
     # Horizontal
     if only in ("all", "horizontal"):
@@ -420,29 +572,16 @@ def print_diff(d: Dict[str, Any]) -> None:
 # -----------------------------
 # Output path builder
 # -----------------------------
-def build_out_path(
-    out_arg: Optional[str],
-    model: str,
-    scope_name: str,
-    run_tag: Optional[str],
-) -> Optional[Path]:
-    """
-    If out_arg is:
-      - None: return None
-      - ends with '.json': treat as file path (no auto naming)
-      - otherwise: treat as directory, create auto file name
-    """
+def build_out_path(out_arg: Optional[str], model: str, scope_name: str, run_tag: Optional[str]) -> Optional[Path]:
     if out_arg is None:
         return None
 
     p = Path(out_arg)
 
-    # Explicit file path
     if p.suffix.lower() == ".json":
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
-    # Directory mode
     p.mkdir(parents=True, exist_ok=True)
 
     if run_tag:
@@ -463,13 +602,8 @@ def main() -> None:
     ap.add_argument("--backend", default="@py", help="pyvisa backend (default: @py)")
     ap.add_argument("--timeout", type=float, default=5.0, help="VISA timeout seconds")
 
-    ap.add_argument("--config", default="config.json", help="Config JSON path (used for channels_max and IP->NAME)")
-    ap.add_argument(
-        "--channels-max",
-        type=int,
-        default=None,
-        help="Override scope_profile.channels_max (e.g. 8 for WR, 4 for WP)",
-    )
+    ap.add_argument("--config", default="config.json", help="Config JSON path (used for IP->NAME + channels_max)")
+    ap.add_argument("--channels-max", type=int, default=None, help="Override channel count (e.g. 4 or 8)")
 
     ap.add_argument(
         "--only",
@@ -485,6 +619,14 @@ def main() -> None:
         help="Trigger print style: smart (Edge minimal, Logic full) or full (always all trigger keys)",
     )
 
+    ap.add_argument("--status", dest="do_status", action="store_true", help="Collect SCPI/VBS status (recommended)")
+    ap.add_argument("--no-status", dest="do_status", action="store_false", help="Do not collect status")
+    ap.set_defaults(do_status=True)
+
+    ap.add_argument("--probe-acquire", action="store_true", help="(Side effects) Call VBS Acquire once")
+    ap.add_argument("--probe-timeout", type=float, default=1.0, help="Probe Acquire timeoutSeconds")
+    ap.add_argument("--probe-force", action="store_true", help="Probe Acquire forceTriggerOnTimeout=1")
+
     ap.add_argument("--print", dest="do_print", action="store_true", help="Print human-readable snapshot")
     ap.add_argument("--no-print", dest="do_print", action="store_false", help="Do not print snapshot")
     ap.set_defaults(do_print=True)
@@ -493,11 +635,7 @@ def main() -> None:
     ap.add_argument("--no-json", dest="do_json", action="store_false", help="Do not write JSON snapshot")
     ap.set_defaults(do_json=True)
 
-    ap.add_argument(
-        "--out",
-        default="snapshots/",
-        help="Output directory (default: snapshots/) or explicit .json file path.",
-    )
+    ap.add_argument("--out", default="snapshots/", help="Output directory or explicit .json file path")
 
     ap.add_argument("--include-raw", action="store_true", help="Include readback_raw in JSON (bigger)")
     ap.add_argument("--no-raw", action="store_true", help="Exclude readback_raw from JSON (smaller)")
@@ -509,12 +647,13 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = load_json(args.config)
-    channels_max = get_channels_max(cfg, args.channels_max)
-
     scope_name = resolve_scope_name(cfg, args.ip)
 
     scope = LeCroyVisa(address=args.ip, visa_backend=args.backend, timeout_s=args.timeout)
     scope.connect()
+
+    # Decide channel count AFTER connect (auto by model/family)
+    channels_max = get_channels_max(cfg, args.channels_max, scope=scope)
 
     keys = build_keys(cfg, channels_max=channels_max, only=args.only)
 
@@ -522,11 +661,20 @@ def main() -> None:
     readback_raw: Dict[str, Any] = {}
     missing: List[Dict[str, str]] = []
 
+    if args.do_status:
+        status_dict, status_missing = collect_status(
+            scope,
+            do_probe_acquire=args.probe_acquire,
+            probe_timeout_s=args.probe_timeout,
+            probe_force=args.probe_force,
+        )
+        readback_human.update(status_dict)
+        missing.extend(status_missing)
+
     for k in keys:
         val, miss = safe_read_key(scope, k)
         readback_human[k] = val
 
-        # Raw mapping by resolved VBS path
         try:
             vbs_path = scope.to_vbs_path(k)
             readback_raw[vbs_path] = val
@@ -551,19 +699,13 @@ def main() -> None:
         missing=missing,
     )
 
-    # Print
     if args.do_print:
-        print_header(scope, args.ip, scope_name)
-
+        print_header(scope, args.ip, scope_name, channels_max=channels_max)
         if run_tag:
             print(f"Run      : {run_tag}")
 
-        groups = group_items(
-            readback_human=readback_human,
-            only=args.only,
-            trigger_view=args.trigger_view,
-        )
-        for title in ["Trigger", "Horizontal", "AUX OUT", "Save", "Channels"]:
+        groups = group_items(readback_human=readback_human, only=args.only, trigger_view=args.trigger_view)
+        for title in ["Status", "Trigger", "Horizontal", "AUX OUT", "Save", "Channels"]:
             print_group(title, groups.get(title, []))
 
         print_missing(missing, show_all=args.show_missing)
@@ -573,18 +715,12 @@ def main() -> None:
             d = diff_snapshots(old, snap.to_dict(include_raw=True))
             print_diff(d)
 
-    # JSON dump
     if args.do_json:
         include_raw = args.include_raw and (not args.no_raw)
         if args.no_raw:
             include_raw = False
 
-        out_path = build_out_path(
-            args.out,
-            model=scope.model,
-            scope_name=scope_name,
-            run_tag=run_tag,
-        )
+        out_path = build_out_path(args.out, model=scope.model, scope_name=scope_name, run_tag=run_tag)
         if out_path is not None:
             write_json(out_path, snap.to_dict(include_raw=include_raw))
             if args.do_print:

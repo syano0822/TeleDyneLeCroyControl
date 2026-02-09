@@ -14,11 +14,11 @@
 	    "192.168.0.113": "WR8204_TRACKER2_1"
 	}
     },
-    
+
     "horizontal": {
-	"sample_mode": "Sequence",
-	"num_segments": 200,
-	"sequence_timeout_enable": true,
+	"sample_mode": "RealTime",
+	"num_segments": 10,
+	"sequence_timeout_enable": false,
 	"sequence_timeout": 10.0,
 	"hor_scale": 2.0e-7,
 	"hor_offset": 0.0

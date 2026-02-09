@@ -7,6 +7,12 @@
 #  - IP -> NAME mapping from config.json (scope_profile.scope_names)
 #  - --runnumber to fill runXXXXXX (zero-padded 6 digits) into trace_title_prefix
 #
+# NEW (debug/robust):
+#  - TRIG_MODE apply now verifies readback with TRIG_MODE?
+#  - If mode_scpi is "NORMAL", also tries "NORM" (LeCroy common alias)
+#  - Re-assert TRIG_MODE at end (helps detect "it got reset later" issues)
+#  - Prints TRIG_SELECT? / TRIG_PATTERN? readback for trigger consistency
+#
 # Usage:
 #   python3 apply_config.py --ip 192.168.0.100 --config config.json --runnumber 23
 
@@ -95,6 +101,14 @@ def _scope_write(scope: LeCroyVisa, scpi_cmd: str) -> None:
     raise AttributeError("LeCroyVisa lacks write()/write_scpi().")
 
 
+def _scope_query(scope: LeCroyVisa, scpi_cmd: str) -> str:
+    if hasattr(scope, "query"):
+        return str(scope.query(scpi_cmd))
+    if hasattr(scope, "query_scpi"):
+        return str(scope.query_scpi(scpi_cmd))
+    raise AttributeError("LeCroyVisa lacks query()/query_scpi().")
+
+
 def set_with_policy(
     scope: LeCroyVisa,
     key: str,
@@ -138,6 +152,95 @@ def write_with_policy(
         return False, msg
 
 
+def query_with_policy(
+    scope: LeCroyVisa,
+    cmd: str,
+    dry_run: bool,
+    stop_on_error: bool,
+) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        if dry_run:
+            print(f"[DRYRUN] query {cmd}")
+            return None, None
+        out = _scope_query(scope, cmd).strip()
+        print(f"[READ] {cmd} -> {out}")
+        return out, None
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        print(f"[ERR] query {cmd} -> {msg}")
+        if stop_on_error:
+            raise
+        return None, msg
+
+
+def set_trig_mode_verified(
+    scope: LeCroyVisa,
+    requested: str,
+    dry_run: bool,
+    stop_on_error: bool,
+) -> None:
+    """
+    Robust TRIG_MODE setter + readback verification.
+
+    - Tries the requested string.
+    - If requested is "NORMAL", also tries "NORM" (common LeCroy alias).
+    - Prints TRIG_MODE? readback.
+    """
+    req = str(requested).strip().upper()
+    candidates = [req]
+    if req == "NORMAL":
+        candidates = ["NORMAL", "NORM"]
+
+    last_err: Optional[str] = None
+    for m in candidates:
+        ok, err = write_with_policy(scope, f"TRIG_MODE {m}", dry_run, stop_on_error)
+        if not ok:
+            last_err = err
+            continue
+
+        rb, rb_err = query_with_policy(scope, "TRIG_MODE?", dry_run, stop_on_error)
+        if rb_err is not None:
+            last_err = rb_err
+            continue
+
+        # If dry_run, rb is None; accept
+        if rb is None:
+            print(f"[TRIG_MODE] (dry-run) set={m}")
+            return
+
+        # Accept if readback contains our mode token (AUTO/NORM/SINGLE/STOP/etc.)
+        # LeCroy sometimes returns "NORM" rather than "NORMAL".
+        rb_u = rb.strip().upper()
+        want_tokens = {m}
+        if m == "NORMAL":
+            want_tokens.add("NORM")
+        if m == "NORM":
+            want_tokens.add("NORMAL")
+
+        if any(tok in rb_u for tok in want_tokens):
+            print(f"[TRIG_MODE] set={m} readback={rb}")
+            return
+
+        # Mismatch: continue trying other candidates
+        last_err = f"readback mismatch (set {m}, got {rb})"
+
+    # If we reach here, all candidates failed or mismatched
+    msg = f"Failed to set TRIG_MODE to {requested!r}. Last error: {last_err}"
+    print(f"[WARN] {msg}")
+    if stop_on_error:
+        raise RuntimeError(msg)
+
+
+def print_trigger_readbacks(scope: LeCroyVisa, dry_run: bool, stop_on_error: bool) -> None:
+    """
+    Helpful consistency readbacks after applying trigger-related settings.
+    """
+    print("\n=== Trigger readback (SCPI) ===")
+    query_with_policy(scope, "TRIG_MODE?", dry_run, stop_on_error)
+    query_with_policy(scope, "TRIG_SELECT?", dry_run, stop_on_error)
+    query_with_policy(scope, "TRIG_PATTERN?", dry_run, stop_on_error)
+
+
 # -------------------------
 # Apply config (human-friendly)
 # -------------------------
@@ -154,6 +257,9 @@ def apply_human_config(
     print(f"Connected: {idn}")
     print(f"Name     : {scope_name}")
     print(f"Dry-run  : {dry_run}   Stop-on-error: {stop_on_error}")
+
+    # Keep track if mode_scpi was requested; we re-assert at end
+    requested_trig_mode_scpi: Optional[str] = None
 
     # -------------------------
     # horizontal
@@ -182,7 +288,6 @@ def apply_human_config(
             if not isinstance(params, dict):
                 continue
             for field, val in params.items():
-                # expects: view, coupling, scale, offset, invert, bandwidth_limit, ...
                 set_with_policy(scope, f"channels.{ch}.{field}", val, dry_run, stop_on_error)
 
     # -------------------------
@@ -215,11 +320,14 @@ def apply_human_config(
             for src, st in pattern_states.items():
                 set_with_policy(scope, f"trigger.pattern_states.{src}", st, dry_run, stop_on_error)
 
-        # SCPI trigger mode (optional)
+        # SCPI trigger mode (optional) with verification
         mode_scpi = trigger.get("mode_scpi", None)
         if mode_scpi:
-            cmd = f"TRIG_MODE {str(mode_scpi).strip()}"
-            write_with_policy(scope, cmd, dry_run, stop_on_error)
+            requested_trig_mode_scpi = str(mode_scpi).strip()
+            set_trig_mode_verified(scope, requested_trig_mode_scpi, dry_run, stop_on_error)
+
+        # Always print trigger readbacks after applying trigger section
+        print_trigger_readbacks(scope, dry_run, stop_on_error)
 
     # -------------------------
     # AUX OUT
@@ -246,7 +354,7 @@ def apply_human_config(
             sw["trace_title_prefix"] = new_prefix
             print(f"[INFO] resolved trace_title_prefix: {prefix!r} -> {new_prefix!r}")
 
-        # Apply mapped save keys (if supported by lecroy_visa.py)
+        # Apply mapped save keys
         if "save_to" in sw:
             set_with_policy(scope, "save.save_to", sw["save_to"], dry_run, stop_on_error)
         if "waveform_dir" in sw:
@@ -254,12 +362,18 @@ def apply_human_config(
         if "wave_format" in sw:
             set_with_policy(scope, "save.wave_format", sw["wave_format"], dry_run, stop_on_error)
         if "trace_title_prefix" in sw:
-            # store the resolved title string on the scope if mapping exists
             set_with_policy(scope, "save.trace_title", sw["trace_title_prefix"], dry_run, stop_on_error)
 
-        # informational only
         if "sources" in sw:
             print(f"[INFO] save_waveforms.sources = {sw['sources']}")
+
+    # -------------------------
+    # Final: re-assert TRIG_MODE if requested (detect resets)
+    # -------------------------
+    if requested_trig_mode_scpi:
+        print("\n=== Final verify: TRIG_MODE re-assert ===")
+        set_trig_mode_verified(scope, requested_trig_mode_scpi, dry_run, stop_on_error)
+        print_trigger_readbacks(scope, dry_run, stop_on_error)
 
     print("\nDone.")
 
